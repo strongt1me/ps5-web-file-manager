@@ -1,0 +1,4 @@
+gen/
+web-file-mgr.elf
+*.o
+*.d

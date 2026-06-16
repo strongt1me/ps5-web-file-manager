@@ -1,0 +1,75 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PS5 Web File Manager</title>
+  <link rel="stylesheet" href="/main.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div id="path" class="path">/</div>
+      <div id="spaceInfo" class="space-info"></div>
+      <button id="exitBtn" class="icon-button power-button" type="button" aria-label="Exit"></button>
+    </header>
+
+    <section class="toolbar">
+      <div class="tool-left">
+        <button id="copyBtn" data-i18n="copy"></button>
+        <button id="moveBtn" data-i18n="move"></button>
+        <button id="renameBtn" data-i18n="rename"></button>
+        <button id="deleteBtn" class="danger" data-i18n="delete"></button>
+        <button id="pasteBtn" class="paste-action" hidden>
+          <span id="pasteVerb" data-i18n="paste"></span>
+          <span id="pasteName" class="paste-name"></span>
+          <span id="pasteTargetText" data-i18n="pasteToCurrent"></span>
+        </button>
+        <button id="clearClipboardBtn" data-i18n="cancel" hidden></button>
+      </div>
+      <div class="tool-right">
+        <button id="refreshBtn" data-i18n="refresh"></button>
+        <button id="mkdirBtn" data-i18n="mkdir"></button>
+      </div>
+    </section>
+
+    <section id="content" class="content">
+      <table>
+        <thead>
+          <tr>
+            <th class="select-col"><label class="select-hit"><input id="selectAll" type="checkbox"></label></th>
+            <th class="name-col" data-i18n="name"></th>
+            <th class="type-col" data-i18n="type"></th>
+            <th class="size-col" data-i18n="size"></th>
+            <th class="time-col" data-i18n="mtime"></th>
+            <th class="mode-col" data-i18n="mode"></th>
+          </tr>
+        </thead>
+        <tbody id="files"></tbody>
+      </table>
+      <div id="empty" class="empty" data-i18n="empty" hidden></div>
+    </section>
+
+    <footer class="status">
+      <div id="statusText" data-i18n="ready"></div>
+      <div id="versionText" class="version-text"></div>
+    </footer>
+  </main>
+
+  <div id="taskOverlay" class="task-overlay" hidden>
+    <div class="task-panel">
+      <div id="tasks" class="tasks"></div>
+    </div>
+  </div>
+
+  <div id="initLoading" class="init-loading" aria-hidden="true">
+    <div class="loading-dots">
+      <span></span>
+      <span></span>
+      <span></span>
+    </div>
+  </div>
+
+  <script src="/main.js"></script>
+</body>
+</html>
