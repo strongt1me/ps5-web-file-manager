@@ -7,6 +7,15 @@ safely copying game dump folders from USB storage to internal storage.
 
 PS5 web file manager payload. It runs an HTTP UI starting at port `8888`, installs a home screen launcher in Media catagory on startup when needed, and provides file operations from the PS5 browser. If `8888` is already in use, the payload tries the next port until one is available; the startup notification shows the actual listen port.
 
+## Screenshots
+
+<p>
+  <a href="docs/screenshots/20260617_231827.376.jpg" target="_blank"><img src="docs/screenshots/20260617_231827.376.jpg" width="23%" alt="PS5 Web File Manager screenshot 1"></a>
+  <a href="docs/screenshots/20260617_231842.645.jpg" target="_blank"><img src="docs/screenshots/20260617_231842.645.jpg" width="23%" alt="PS5 Web File Manager screenshot 2"></a>
+  <a href="docs/screenshots/20260617_232348.855.jpg" target="_blank"><img src="docs/screenshots/20260617_232348.855.jpg" width="23%" alt="PS5 Web File Manager screenshot 3"></a>
+  <a href="docs/screenshots/20260617_231943.120.jpg" target="_blank"><img src="docs/screenshots/20260617_231943.120.jpg" width="23%" alt="PS5 Web File Manager screenshot 4"></a>
+</p>
+
 ## Features
 
 - List files and folders.
