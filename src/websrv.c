@@ -13,6 +13,34 @@
 #include "filemgr.h"
 #include "websrv.h"
 
+#define REQUEST_BODY_MAX (1024 * 1024)
+
+typedef struct request_context {
+  char *body;
+  size_t size;
+  int too_large;
+} request_context_t;
+
+static enum MHD_Result
+websrv_body_too_large(struct MHD_Connection *conn) {
+  static const char json[] =
+    "{\"ok\":false,\"error\":\"request body is too large\","
+    "\"error_code\":\"text_file_too_large\",\"error_arg\":\"\"}";
+  struct MHD_Response *resp =
+    MHD_create_response_from_buffer(sizeof(json) - 1, (void *)json,
+                                    MHD_RESPMEM_PERSISTENT);
+  enum MHD_Result ret;
+
+  if(!resp) {
+    return MHD_NO;
+  }
+  MHD_add_response_header(resp, MHD_HTTP_HEADER_CONTENT_TYPE,
+                          "application/json");
+  ret = websrv_queue_response(conn, MHD_HTTP_CONTENT_TOO_LARGE, resp);
+  MHD_destroy_response(resp);
+  return ret;
+}
+
 enum MHD_Result
 websrv_queue_response(struct MHD_Connection *conn, unsigned int status,
                       struct MHD_Response *resp) {
@@ -26,10 +54,9 @@ websrv_on_request(void *cls, struct MHD_Connection *conn, const char *url,
                   const char *method, const char *version,
                   const char *upload_data, size_t *upload_data_size,
                   void **con_cls) {
+  request_context_t *ctx = *con_cls;
   (void)cls;
   (void)version;
-  (void)upload_data;
-  (void)upload_data_size;
 
   if(strcmp(method, MHD_HTTP_METHOD_GET) &&
      strcmp(method, MHD_HTTP_METHOD_POST) &&
@@ -37,13 +64,39 @@ websrv_on_request(void *cls, struct MHD_Connection *conn, const char *url,
     return MHD_NO;
   }
 
-  if(!*con_cls) {
-    *con_cls = (void *)1;
+  if(!ctx) {
+    if(!(ctx = calloc(1, sizeof(*ctx)))) {
+      return MHD_NO;
+    }
+    *con_cls = ctx;
     return MHD_YES;
   }
 
+  if(*upload_data_size) {
+    size_t chunk_size = *upload_data_size;
+
+    if(chunk_size > REQUEST_BODY_MAX - ctx->size) {
+      ctx->too_large = 1;
+    } else if(!ctx->too_large) {
+      char *body = realloc(ctx->body, ctx->size + chunk_size + 1);
+      if(!body) {
+        return MHD_NO;
+      }
+      ctx->body = body;
+      memcpy(ctx->body + ctx->size, upload_data, chunk_size);
+      ctx->size += chunk_size;
+      ctx->body[ctx->size] = 0;
+    }
+    *upload_data_size = 0;
+    return MHD_YES;
+  }
+
+  if(ctx->too_large) {
+    return websrv_body_too_large(conn);
+  }
+
   if(!strncmp(url, "/api/", 5)) {
-    return filemgr_api_request(conn, url);
+    return filemgr_api_request(conn, url, method, ctx->body, ctx->size);
   }
   if(!strcmp(url, "/fs")) {
     return filemgr_fs_request(conn);
@@ -60,6 +113,12 @@ websrv_on_completed(void *cls, struct MHD_Connection *connection,
   (void)cls;
   (void)connection;
   (void)toe;
+  request_context_t *ctx = *con_cls;
+
+  if(ctx) {
+    free(ctx->body);
+    free(ctx);
+  }
   *con_cls = NULL;
 }
 

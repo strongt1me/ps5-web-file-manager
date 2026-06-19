@@ -10,9 +10,13 @@ let pendingAbortController = null;
 let taskRefreshPath = "/";
 let hoverPaused = false;
 let hoverResumeTimer = 0;
+let textEditorPath = null;
+let textEditorVersion = null;
+let textEditorOriginal = "";
+let textEditorBusy = false;
 let L = {};
 
-const APP_VERSION = "v0.2";
+const APP_VERSION = "v0.3";
 const LAST_PATH_KEY = "ps5-web-file-mgr:last-path";
 
 const filesEl = document.getElementById("files");
@@ -32,6 +36,13 @@ const pasteTargetTextEl = document.getElementById("pasteTargetText");
 const clearClipboardBtn = document.getElementById("clearClipboardBtn");
 const initLoadingEl = document.getElementById("initLoading");
 const exitBtn = document.getElementById("exitBtn");
+const textEditorOverlayEl = document.getElementById("textEditorOverlay");
+const textEditorPathEl = document.getElementById("textEditorPath");
+const textEditorEl = document.getElementById("textEditor");
+const textEditorStatusEl = document.getElementById("textEditorStatus");
+const textEditorCloseBtn = document.getElementById("textEditorCloseBtn");
+const textEditorSaveBtn = document.getElementById("textEditorSaveBtn");
+const newTextBtn = document.getElementById("newTextBtn");
 
 function chooseLanguage() {
   const langs = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language || ""];
@@ -88,17 +99,29 @@ function applyStaticText() {
   if (initLoadingEl) initLoadingEl.hidden = true;
 }
 
-function api(path, params, options) {
+async function request(path, params, options) {
   const qs = new URLSearchParams(params || {});
   const fetchOptions = Object.assign({ method: "POST" }, options || {});
-  return fetch(path + (qs.toString() ? "?" + qs.toString() : ""), fetchOptions)
-    .then(async response => {
-      const data = await response.json();
-      if (!response.ok || !data.ok) {
-        throw new Error(backendErrorText(data.error_code, data.error_arg, data.error));
-      }
-      return data;
-    });
+  const response = await fetch(path + (qs.toString() ? "?" + qs.toString() : ""), fetchOptions);
+  if (!response.ok) {
+    const data = await response.json();
+    throw new Error(backendErrorText(data.error_code, data.error_arg, data.error));
+  }
+  return response;
+}
+
+async function api(path, params, options) {
+  const data = await (await request(path, params, options)).json();
+  if (!data.ok) throw new Error(backendErrorText(data.error_code, data.error_arg, data.error));
+  return data;
+}
+
+async function fetchText(path, params) {
+  const response = await request(path, params, { method: "GET" });
+  return {
+    text: await response.text(),
+    version: response.headers.get("X-Text-Version") || ""
+  };
 }
 
 function formatSize(size, type) {
@@ -119,7 +142,16 @@ function formatBytes(size, decimals) {
 }
 
 function formatTime(seconds) {
-  return seconds ? new Date(seconds * 1000).toLocaleString() : "";
+  if (!seconds) return "";
+  const date = new Date(seconds * 1000);
+  const year = date.getFullYear();
+  const month = date.getMonth() + 1;
+  const day = date.getDate();
+  const time = [date.getHours(), date.getMinutes(), date.getSeconds()]
+    .map(value => value < 10 ? "0" + value : value).join(":");
+  return document.documentElement.lang === "en" ?
+    month + "/" + day + "/" + year + ", " + time :
+    year + "/" + month + "/" + day + " " + time;
 }
 
 function formatSpeed(bytes) {
@@ -277,6 +309,118 @@ function typeLabel(type) {
   return type === "d" ? t("dir") : t("file");
 }
 
+function isEditableText(item) {
+  return item.type === "-" &&
+    /\.(txt|json|xml|ini|cfg|conf|md|log|lua|js|css|html?|c|h|cpp|hpp|sh|csv|ya?ml)$/i.test(item.name);
+}
+
+function setTextEditorBusy(value, status) {
+  textEditorBusy = value;
+  textEditorEl.disabled = value;
+  textEditorCloseBtn.disabled = value;
+  textEditorSaveBtn.disabled = value;
+  textEditorStatusEl.textContent = status || "";
+}
+
+function closeTextEditor() {
+  if (textEditorBusy) return;
+  textEditorOverlayEl.hidden = true;
+  textEditorPath = null;
+  textEditorVersion = null;
+  textEditorOriginal = "";
+  textEditorEl.value = "";
+  textEditorStatusEl.textContent = "";
+  return load(cwd, false, true);
+}
+
+function requestCloseTextEditor() {
+  if (textEditorBusy) return;
+  if (textEditorEl.value !== textEditorOriginal &&
+      confirm(t("unsavedSaveConfirm"))) return saveTextEditor();
+  return closeTextEditor();
+}
+
+function showTextEditor(item, text, version) {
+  textEditorPath = item.path;
+  textEditorVersion = version;
+  textEditorPathEl.textContent = item.path;
+  textEditorPathEl.title = item.path;
+  textEditorEl.value = text;
+  textEditorOriginal = textEditorEl.value;
+  textEditorOverlayEl.hidden = false;
+  setTextEditorBusy(false, "");
+  textEditorEl.focus();
+}
+
+async function openTextEditor(item) {
+  if (busy || textEditorBusy) return;
+  textEditorPath = item.path;
+  textEditorVersion = null;
+  textEditorOriginal = "";
+  textEditorPathEl.textContent = item.path;
+  textEditorPathEl.title = item.path;
+  textEditorEl.value = "";
+  textEditorOverlayEl.hidden = false;
+  setTextEditorBusy(true, t("loadingText"));
+  try {
+    const data = await fetchText("/api/text", { path: item.path });
+    showTextEditor(item, data.text, data.version);
+  } catch (err) {
+    setTextEditorBusy(false, "");
+    textEditorOverlayEl.hidden = true;
+    textEditorPath = null;
+    const message = t("openTextFailed", { error: err.message });
+    setStatus(message);
+    alert(message);
+  }
+}
+
+async function saveTextEditor() {
+  if (textEditorBusy || !textEditorPath || !textEditorVersion) return;
+  if (textEditorEl.value === textEditorOriginal) {
+    await closeTextEditor();
+    return;
+  }
+  const path = textEditorPath;
+  setTextEditorBusy(true, t("savingText"));
+  try {
+    await api("/api/text/save", { path, version: textEditorVersion }, {
+      body: textEditorEl.value,
+      headers: { "Content-Type": "text/plain; charset=utf-8" }
+    });
+    setTextEditorBusy(false, "");
+    await closeTextEditor();
+    setStatus(t("textSaved"));
+  } catch (err) {
+    setTextEditorBusy(false, "");
+    const message = t("saveTextFailed", { error: err.message });
+    setStatus(message);
+    alert(message);
+  }
+}
+
+async function actionNewText() {
+  if (busy) return;
+  const dir = cwd;
+  const name = (prompt(t("newTextPrompt"), "") || "").trim();
+  if (!name) return;
+  const item = { name, path: pathJoin(dir, name), type: "-" };
+
+  try {
+    setBusy(true);
+    setStatus(t("creatingText"));
+    const data = await api("/api/text/create", { path: dir, name });
+    await load(dir, false, true);
+    setBusy(false);
+    showTextEditor(item, "", data.version);
+  } catch (err) {
+    setBusy(false);
+    const message = t("createTextFailed", { error: err.message });
+    setStatus(message);
+    alert(message);
+  }
+}
+
 function resetScrollTop() {
   const apply = () => {
     contentEl.scrollTop = 0;
@@ -354,6 +498,7 @@ function updateButtons() {
   document.getElementById("renameBtn").disabled = busy || items.length !== 1;
   document.getElementById("deleteBtn").disabled = busy || items.length === 0;
   document.getElementById("mkdirBtn").disabled = busy;
+  newTextBtn.disabled = busy;
   selectAllEl.checked = entries.length > 0 && items.length === entries.length;
   selectAllEl.indeterminate = items.length > 0 && items.length < entries.length;
   renderClipboard();
@@ -483,6 +628,7 @@ function render() {
     nameBtn.addEventListener("click", () => {
       focusPath(item.path);
       if (isParent || item.type === "d") load(item.path);
+      else if (isEditableText(item)) openTextEditor(item);
       else togglePath(item.path, !selected.has(item.path));
     });
     appendChildren(nameBtn, icon, nameText);
@@ -867,7 +1013,7 @@ function actionRename() {
   if (busy) return;
   const item = singleSelected();
   if (!item) return;
-  const name = prompt(t("renamePrompt"), item.name);
+  const name = (prompt(t("renamePrompt"), item.name) || "").trim();
   if (!name || name === item.name) return;
   runImmediateAction(t("rename"), () => api("/api/rename", { path: item.path, name }));
 }
@@ -896,7 +1042,7 @@ document.getElementById("refreshBtn").addEventListener("click", () => load(cwd, 
 document.getElementById("mkdirBtn").addEventListener("click", () => {
   if (busy) return;
   const path = cwd;
-  const name = prompt(t("mkdirPrompt"));
+  const name = (prompt(t("mkdirPrompt")) || "").trim();
   if (!name) return;
   runImmediateAction(t("mkdir"), () => api("/api/mkdir", { path, name }));
 });
@@ -907,6 +1053,9 @@ clearClipboardBtn.addEventListener("click", clearClipboard);
 document.getElementById("renameBtn").addEventListener("click", actionRename);
 document.getElementById("deleteBtn").addEventListener("click", actionDelete);
 exitBtn.addEventListener("click", actionExit);
+textEditorCloseBtn.addEventListener("click", requestCloseTextEditor);
+textEditorSaveBtn.addEventListener("click", saveTextEditor);
+newTextBtn.addEventListener("click", actionNewText);
 selectAllEl.addEventListener("change", () => {
   selected.clear();
   if (selectAllEl.checked) entries.forEach(item => selected.add(item.path));

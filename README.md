@@ -10,16 +10,18 @@ PS5 web file manager payload. It runs an HTTP UI starting at port `8888`, instal
 ## Screenshots
 
 <p>
-  <a href="docs/screenshots/20260617_231827.376.jpg" target="_blank"><img src="docs/screenshots/20260617_231827.376.jpg" width="23%" alt="PS5 Web File Manager screenshot 1"></a>
-  <a href="docs/screenshots/20260617_231842.645.jpg" target="_blank"><img src="docs/screenshots/20260617_231842.645.jpg" width="23%" alt="PS5 Web File Manager screenshot 2"></a>
-  <a href="docs/screenshots/20260617_232348.855.jpg" target="_blank"><img src="docs/screenshots/20260617_232348.855.jpg" width="23%" alt="PS5 Web File Manager screenshot 3"></a>
-  <a href="docs/screenshots/20260617_231943.120.jpg" target="_blank"><img src="docs/screenshots/20260617_231943.120.jpg" width="23%" alt="PS5 Web File Manager screenshot 4"></a>
+  <a href="docs/screenshots/20260617_231827.376.jpg" target="_blank"><img src="docs/screenshots/20260617_231827.376.jpg" width="31%" alt="PS5 Web File Manager screenshot 1"></a>
+  <a href="docs/screenshots/20260619_131432.399.jpg" target="_blank"><img src="docs/screenshots/20260619_131432.399.jpg" width="31%" alt="PS5 Web File Manager screenshot 2"></a>
+  <a href="docs/screenshots/20260617_232348.855.jpg" target="_blank"><img src="docs/screenshots/20260617_232348.855.jpg" width="31%" alt="PS5 Web File Manager screenshot 3"></a>
+  <a href="docs/screenshots/20260619_131811.644.jpg" target="_blank"><img src="docs/screenshots/20260619_131811.644.jpg" width="31%" alt="PS5 Web File Manager screenshot 4"></a>
+  <a href="docs/screenshots/20260619_131535.239.jpg" target="_blank"><img src="docs/screenshots/20260619_131535.239.jpg" width="31%" alt="PS5 Web File Manager screenshot 5"></a>
 </p>
 
 ## Features
 
 - List files and folders.
 - Copy, move, delete, rename, and create folders.
+- Edit UTF-8 text files up to 1 MiB using the built-in plain text editor.
 - Multi-select operations.
 - Copy/move by choosing sources first, then pasting or moving them into the current folder.
 - Conflict prompts for overwriting files and merging folders.
@@ -27,6 +29,7 @@ PS5 web file manager payload. It runs an HTTP UI starting at port `8888`, instal
 - Copied/moved files and folders are set to `0777` where the filesystem supports Unix permissions. FAT/exFAT-style filesystems may ignore chmod.
 - Chinese and English UI. The browser language is read from `navigator.languages` / `navigator.language`; Chinese uses `zh`, everything else uses English.
 - Startup notification showing the app name, version, and listen port.
+- Create/edit text files ending with `.txt`, `.json`, `.xml`, `.ini`, `.cfg`, `.conf`, `.md`, `.log`, `.lua`, `.js`, `.css`, `.html`, `.htm`, `.c`, `.h`, `.cpp`, `.hpp`, `.sh`, `.csv`, `.yaml`, `.yml`.
 
 ## Build
 
@@ -86,6 +89,7 @@ On first startup the payload installs a `PS5 Web File Manager` web shortcut in t
 - Delete is recursive and permanent. There is no recycle bin.
 - Copy/move tasks can be canceled. A partially copied single file is removed, but partially copied folders are left in place to avoid deleting existing files when merging into an existing target folder.
 - The UI can recover the active task display if the browser is closed and reopened while the payload process is still running.
+- Text editing is limited to common text-file extensions. Non-UTF-8 and oversized files are rejected.
 
 ## Credits
 

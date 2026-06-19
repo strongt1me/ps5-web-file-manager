@@ -13,7 +13,7 @@ ifeq ($(MAKECMDGOALS),)
   endif
 endif
 
-VERSION_TAG := v0.2
+VERSION_TAG := v0.3
 TITLE_ID    := FMGR88888
 PYTHON      ?= python3
 STRIP       ?= $(PS5_PAYLOAD_SDK)/bin/prospero-strip
@@ -63,7 +63,7 @@ gen:
 clean:
 	rm -rf $(BIN) $(LEGACY_BIN) $(LINUX_BIN) gen
 
-gen/%.c: assets/% gen-asset-module.py gen
+gen/%.c: assets/% gen-asset-module.py | gen
 	$(PYTHON) gen-asset-module.py --path $* $< > $@
 
 $(BIN): $(PS5_SRCS) $(GEN_SRCS)

@@ -237,6 +237,20 @@ button:disabled,
   background: #402326;
 }
 
+.primary {
+  border-color: #4f9f7b;
+  background: #285943;
+}
+
+button.primary:hover {
+  background: #347358;
+}
+
+.secondary {
+  border-color: #59636e;
+  background: #20262d;
+}
+
 .paste-action {
   max-width: 480px;
 }
@@ -417,6 +431,82 @@ input[type="checkbox"] {
 .version-text {
   flex: 0 0 auto;
   color: #7f8a94;
+}
+
+.text-editor-overlay {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 9000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 48px;
+  background: rgba(4, 6, 8, .9);
+}
+
+.text-editor-panel {
+  width: 1200px;
+  height: calc(100vh - 96px);
+  max-width: calc(100vw - 96px);
+  display: flex;
+  flex-direction: column;
+  padding: 24px;
+  border: 1px solid #46515f;
+  border-radius: 10px;
+  background: #15191e;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, .45);
+}
+
+.text-editor-path {
+  margin-bottom: 14px;
+  overflow: hidden;
+  color: #c9d3dc;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 20px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.text-editor {
+  width: 100%;
+  min-height: 0;
+  flex: 1 1 auto;
+  padding: 18px;
+  border: 1px solid #46515f;
+  border-radius: 6px;
+  outline: none;
+  resize: none;
+  background: #0f1215;
+  color: #edf0f2;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 20px;
+  line-height: 1.5;
+}
+
+.text-editor:focus {
+  border-color: #6fb1ff;
+}
+
+.text-editor-status {
+  min-height: 28px;
+  padding-top: 8px;
+  color: #aab4be;
+  font-size: 18px;
+}
+
+.text-editor-actions {
+  display: flex;
+}
+
+.text-editor-actions button {
+  flex: 1 1 0;
+}
+
+.text-editor-actions button + button {
+  margin-left: 14px;
 }
 
 .task-overlay {
