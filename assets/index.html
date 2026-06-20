@@ -49,6 +49,9 @@
         <tbody id="files"></tbody>
       </table>
       <div id="empty" class="empty" data-i18n="empty" hidden></div>
+      <div id="contentLoading" class="content-loading" hidden>
+        <div class="content-loading-text" data-i18n="readDir"></div>
+      </div>
     </section>
 
     <footer class="status">
@@ -70,19 +73,22 @@
     </section>
   </div>
 
+  <div id="imagePreviewOverlay" class="text-editor-overlay" hidden>
+    <section class="text-editor-panel image-preview-panel">
+      <div class="image-preview-stage">
+        <img id="imagePreview" class="image-preview" alt="">
+      </div>
+      <button id="imagePreviewCloseBtn" class="secondary" data-i18n="close"></button>
+    </section>
+  </div>
+
   <div id="taskOverlay" class="task-overlay" hidden>
     <div class="task-panel">
       <div id="tasks" class="tasks"></div>
     </div>
   </div>
 
-  <div id="initLoading" class="init-loading" aria-hidden="true">
-    <div class="loading-dots">
-      <span></span>
-      <span></span>
-      <span></span>
-    </div>
-  </div>
+  <div id="initLoading" class="init-loading" aria-hidden="true"></div>
 
   <script src="/main.js"></script>
 </body>

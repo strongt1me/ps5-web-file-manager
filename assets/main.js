@@ -10,17 +10,23 @@ let pendingAbortController = null;
 let taskRefreshPath = "/";
 let hoverPaused = false;
 let hoverResumeTimer = 0;
+let hoveredRow = null;
+let loadingPath = null;
+let directoryLoadingTimer = 0;
+let lastCompletionId = null;
 let textEditorPath = null;
 let textEditorVersion = null;
 let textEditorOriginal = "";
 let textEditorBusy = false;
 let L = {};
 
-const APP_VERSION = "v0.3";
+const APP_VERSION = "v0.4";
 const LAST_PATH_KEY = "ps5-web-file-mgr:last-path";
+const DIRECTORY_LOADING_DELAY = 250;
 
 const filesEl = document.getElementById("files");
 const contentEl = document.getElementById("content");
+const contentLoadingEl = document.getElementById("contentLoading");
 const emptyEl = document.getElementById("empty");
 const pathEl = document.getElementById("path");
 const spaceInfoEl = document.getElementById("spaceInfo");
@@ -43,6 +49,9 @@ const textEditorStatusEl = document.getElementById("textEditorStatus");
 const textEditorCloseBtn = document.getElementById("textEditorCloseBtn");
 const textEditorSaveBtn = document.getElementById("textEditorSaveBtn");
 const newTextBtn = document.getElementById("newTextBtn");
+const imagePreviewOverlayEl = document.getElementById("imagePreviewOverlay");
+const imagePreviewEl = document.getElementById("imagePreview");
+const imagePreviewCloseBtn = document.getElementById("imagePreviewCloseBtn");
 
 function chooseLanguage() {
   const langs = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language || ""];
@@ -53,6 +62,7 @@ function chooseLanguage() {
 function loadLanguage() {
   return new Promise(resolve => {
     const lang = chooseLanguage();
+    initLoadingEl.textContent = lang === "zh" ? "加载中..." : "Loading...";
     const script = document.createElement("script");
     script.src = "/lang-" + lang + ".js";
     script.onload = () => {
@@ -314,6 +324,22 @@ function isEditableText(item) {
     /\.(txt|json|xml|ini|cfg|conf|md|log|lua|js|css|html?|c|h|cpp|hpp|sh|csv|ya?ml)$/i.test(item.name);
 }
 
+function isPreviewableImage(item) {
+  return item.type === "-" && /\.(png|jpe?g|gif|bmp|webp)$/i.test(item.name);
+}
+
+function openImagePreview(item) {
+  if (busy) return;
+  imagePreviewEl.src = "/fs?path=" + encodeURIComponent(item.path);
+  imagePreviewOverlayEl.hidden = false;
+  imagePreviewCloseBtn.focus();
+}
+
+function closeImagePreview() {
+  imagePreviewOverlayEl.hidden = true;
+  imagePreviewEl.removeAttribute("src");
+}
+
 function setTextEditorBusy(value, status) {
   textEditorBusy = value;
   textEditorEl.disabled = value;
@@ -400,9 +426,11 @@ async function saveTextEditor() {
 }
 
 async function actionNewText() {
-  if (busy) return;
+  if (busy || loadingPath) return;
   const dir = cwd;
-  const name = (prompt(t("newTextPrompt"), "") || "").trim();
+  const input = prompt(t("newTextPrompt"));
+  if (input === null) return;
+  const name = input.trim();
   if (!name) return;
   const item = { name, path: pathJoin(dir, name), type: "-" };
 
@@ -467,6 +495,7 @@ function renderTaskName(el, task) {
 
 function renderClipboard() {
   const hasClipboard = Boolean(clipboard && clipboard.items.length);
+  const locked = busy || contentEl.classList.contains("loading");
   pasteBtn.hidden = !hasClipboard;
   clearClipboardBtn.hidden = !hasClipboard;
   if (!hasClipboard) {
@@ -482,8 +511,8 @@ function renderClipboard() {
   pasteVerbEl.textContent = clipboard.op === "move" ? t("move") : t("paste");
   pasteNameEl.textContent = title;
   pasteBtn.title = t("pasteTitle", { label: clipboard.op === "move" ? t("move") : t("paste"), name: title, path: cwd });
-  pasteBtn.disabled = busy;
-  clearClipboardBtn.disabled = busy;
+  pasteBtn.disabled = locked;
+  clearClipboardBtn.disabled = locked;
 }
 
 function singleSelected() {
@@ -493,12 +522,15 @@ function singleSelected() {
 
 function updateButtons() {
   const items = selectedEntries();
-  document.getElementById("copyBtn").disabled = busy || items.length === 0;
-  document.getElementById("moveBtn").disabled = busy || items.length === 0;
-  document.getElementById("renameBtn").disabled = busy || items.length !== 1;
-  document.getElementById("deleteBtn").disabled = busy || items.length === 0;
-  document.getElementById("mkdirBtn").disabled = busy;
-  newTextBtn.disabled = busy;
+  const locked = busy || contentEl.classList.contains("loading");
+  document.getElementById("copyBtn").disabled = locked || items.length === 0;
+  document.getElementById("moveBtn").disabled = locked || items.length === 0;
+  document.getElementById("renameBtn").disabled = locked || items.length !== 1;
+  document.getElementById("deleteBtn").disabled = locked || items.length === 0;
+  document.getElementById("refreshBtn").disabled = locked;
+  document.getElementById("mkdirBtn").disabled = locked;
+  newTextBtn.disabled = locked;
+  selectAllEl.disabled = locked;
   selectAllEl.checked = entries.length > 0 && items.length === entries.length;
   selectAllEl.indeterminate = items.length > 0 && items.length < entries.length;
   renderClipboard();
@@ -513,18 +545,17 @@ function focusPath(path) {
   if (next) next.classList.add("focused");
 }
 
-function hoverPath(path) {
+function hoverRow(row) {
   if (hoverPaused) return;
-  const old = filesEl.querySelector("tr.hovered");
-  if (old && old.dataset.path === path) return;
-  const next = path ? filesEl.querySelector("tr[data-path=\"" + cssEscape(path) + "\"]") : null;
-  if (old) old.classList.remove("hovered");
-  if (next) next.classList.add("hovered");
+  if (hoveredRow === row) return;
+  clearHoverPath();
+  hoveredRow = row;
+  if (hoveredRow) hoveredRow.classList.add("hovered");
 }
 
 function clearHoverPath() {
-  const old = filesEl.querySelector("tr.hovered");
-  if (old) old.classList.remove("hovered");
+  if (hoveredRow) hoveredRow.classList.remove("hovered");
+  hoveredRow = null;
 }
 
 function cssEscape(value) {
@@ -536,11 +567,6 @@ function appendChildren(parent) {
   for (let i = 1; i < arguments.length; i++) {
     parent.appendChild(arguments[i]);
   }
-}
-
-function setClass(el, name, enabled) {
-  if (enabled) el.classList.add(name);
-  else el.classList.remove(name);
 }
 
 function bindPress(el, fn) {
@@ -576,8 +602,10 @@ function togglePath(path, checked) {
 }
 
 function render() {
+  hoveredRow = null;
   filesEl.innerHTML = "";
   emptyEl.hidden = entries.length !== 0;
+  const fragment = document.createDocumentFragment();
 
   const rows = cwd === "/" ? entries : [{
     name: "..",
@@ -592,8 +620,10 @@ function render() {
     const isParent = item.type === "parent";
     const tr = document.createElement("tr");
     tr.dataset.path = item.path;
-    setClass(tr, "selected", !isParent && selected.has(item.path));
-    setClass(tr, "focused", focusedPath === item.path);
+    tr.dataset.name = item.name;
+    tr.dataset.type = item.type;
+    tr.className = (!isParent && selected.has(item.path) ? "selected " : "") +
+      (focusedPath === item.path ? "focused" : "");
 
     const selectTd = document.createElement("td");
     selectTd.className = "select-cell";
@@ -603,8 +633,6 @@ function render() {
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.checked = selected.has(item.path);
-      checkbox.addEventListener("focus", () => focusPath(item.path));
-      checkbox.addEventListener("change", () => togglePath(item.path, checkbox.checked));
       label.appendChild(checkbox);
       selectTd.appendChild(label);
     }
@@ -614,24 +642,18 @@ function render() {
     const nameBtn = document.createElement("button");
     nameBtn.className = "row-action";
     nameBtn.type = "button";
-    const icon = document.createElement("span");
-    icon.className = "icon";
-    const iconImg = document.createElement("img");
-    iconImg.src = isParent ? "/icon-up.png" : item.type === "d" ? "/icon-folder.png" : "/icon-file.png";
-    iconImg.alt = "";
-    icon.appendChild(iconImg);
     const nameText = document.createElement("span");
     nameText.className = "name-text";
     nameText.textContent = item.name;
     nameBtn.title = item.path;
-    nameBtn.addEventListener("focus", () => focusPath(item.path));
-    nameBtn.addEventListener("click", () => {
-      focusPath(item.path);
-      if (isParent || item.type === "d") load(item.path);
-      else if (isEditableText(item)) openTextEditor(item);
-      else togglePath(item.path, !selected.has(item.path));
-    });
-    appendChildren(nameBtn, icon, nameText);
+    const iconImg = document.createElement("img");
+    iconImg.className = "icon";
+    iconImg.src = isParent ? "/icon-up.png" : item.type === "d" ? "/icon-folder.png" :
+      isPreviewableImage(item) ? "/icon-image.png" :
+      isEditableText(item) ? "/icon-file.png" : "/icon-generic.png";
+    iconImg.alt = "";
+    nameBtn.appendChild(iconImg);
+    nameBtn.appendChild(nameText);
     nameTd.appendChild(nameBtn);
 
     appendChildren(
@@ -643,8 +665,9 @@ function render() {
       classCell("time-col", formatTime(item.mtime)),
       classCell("mode-col", isParent ? "" : "0" + Number(item.mode).toString(8))
     );
-    filesEl.appendChild(tr);
+    fragment.appendChild(tr);
   }
+  filesEl.appendChild(fragment);
   updateButtons();
 }
 
@@ -670,7 +693,14 @@ function classCell(className, text) {
 
 async function load(path, scrollTop, force) {
   const shouldScrollTop = scrollTop !== false;
-  if (busy && !force) return;
+  if ((busy && !force) || loadingPath) return;
+  loadingPath = path;
+  directoryLoadingTimer = setTimeout(() => {
+    contentLoadingEl.style.top = contentEl.scrollTop + "px";
+    contentLoadingEl.hidden = false;
+    contentEl.classList.add("loading");
+    updateButtons();
+  }, DIRECTORY_LOADING_DELAY);
   try {
     setStatus(t("readDir"));
     const data = await api("/api/list", { path });
@@ -690,6 +720,12 @@ async function load(path, scrollTop, force) {
     setStatus(t("totalItems", { count: entries.length }));
   } catch (err) {
     setStatus(err.message);
+  } finally {
+    clearTimeout(directoryLoadingTimer);
+    contentEl.classList.remove("loading");
+    contentLoadingEl.hidden = true;
+    loadingPath = null;
+    updateButtons();
   }
 }
 
@@ -728,7 +764,7 @@ async function runImmediateAction(label, fn) {
 }
 
 function setClipboard(op) {
-  if (busy || selected.size === 0) return;
+  if (busy || loadingPath || selected.size === 0) return;
   const items = selectedEntries().map(item => ({ path: item.path, name: item.name, type: item.type }));
   if (items.length === 0) return;
   clipboard = { op, items };
@@ -738,6 +774,7 @@ function setClipboard(op) {
 }
 
 function clearClipboard() {
+  if (busy || loadingPath) return;
   clipboard = null;
   renderClipboard();
   setStatus(t("clipboardCleared"));
@@ -839,7 +876,7 @@ function showPendingOverlay(text) {
 }
 
 async function actionPaste() {
-  if (busy || !clipboard || clipboard.items.length === 0) return;
+  if (busy || loadingPath || !clipboard || clipboard.items.length === 0) return;
   const op = clipboard.op;
   const label = clipboard.op === "move" ? t("move") : t("copy");
   const check = validatePasteTarget();
@@ -971,6 +1008,18 @@ async function pollTasks() {
   try {
     const data = await api("/api/tasks");
     const tasks = data.tasks || [];
+    const completion = data.completion;
+    if (lastCompletionId === null) {
+      lastCompletionId = completion ? completion.id : 0;
+    } else if (completion && completion.id !== lastCompletionId) {
+      lastCompletionId = completion.id;
+      alert(t(completion.file_count ? "transferCompleteFiles" : "transferComplete", {
+        label: opLabel(completion.op),
+        duration: formatDuration(Number(completion.elapsed || 0)),
+        size: formatBytes(completion.total, true),
+        count: completion.file_count
+      }));
+    }
     const wasBusy = busy;
     renderTasks(tasks);
     let shouldRefresh = false;
@@ -1010,7 +1059,7 @@ function actionMove() {
 }
 
 function actionRename() {
-  if (busy) return;
+  if (busy || loadingPath) return;
   const item = singleSelected();
   if (!item) return;
   const name = (prompt(t("renamePrompt"), item.name) || "").trim();
@@ -1019,7 +1068,7 @@ function actionRename() {
 }
 
 function actionDelete() {
-  if (busy || selected.size === 0) return;
+  if (busy || loadingPath || selected.size === 0) return;
   const items = selectedEntries();
   const paths = items.map(item => item.path);
   const target = itemTitle(items);
@@ -1040,7 +1089,7 @@ function actionExit() {
 
 document.getElementById("refreshBtn").addEventListener("click", () => load(cwd, false));
 document.getElementById("mkdirBtn").addEventListener("click", () => {
-  if (busy) return;
+  if (busy || loadingPath) return;
   const path = cwd;
   const name = (prompt(t("mkdirPrompt")) || "").trim();
   if (!name) return;
@@ -1056,16 +1105,48 @@ exitBtn.addEventListener("click", actionExit);
 textEditorCloseBtn.addEventListener("click", requestCloseTextEditor);
 textEditorSaveBtn.addEventListener("click", saveTextEditor);
 newTextBtn.addEventListener("click", actionNewText);
+imagePreviewCloseBtn.addEventListener("click", closeImagePreview);
+textEditorOverlayEl.addEventListener("click", event => {
+  if (event.target === textEditorOverlayEl) requestCloseTextEditor();
+});
+imagePreviewOverlayEl.addEventListener("click", event => {
+  if (event.target === imagePreviewOverlayEl) closeImagePreview();
+});
+contentEl.addEventListener("click", event => {
+  if (!loadingPath) return;
+  event.preventDefault();
+  event.stopPropagation();
+}, true);
+filesEl.addEventListener("focusin", event => {
+  const row = findRowFromTarget(event.target);
+  if (row) focusPath(row.dataset.path);
+});
+filesEl.addEventListener("change", event => {
+  const row = findRowFromTarget(event.target);
+  if (row && event.target.type === "checkbox") togglePath(row.dataset.path, event.target.checked);
+});
+filesEl.addEventListener("click", event => {
+  const row = findRowFromTarget(event.target);
+  if (!row) return;
+  let target = event.target;
+  while (target && target !== row && !target.classList.contains("row-action")) target = target.parentNode;
+  if (target === row && row.dataset.type !== "parent") return;
+  const item = { path: row.dataset.path, name: row.dataset.name, type: row.dataset.type };
+  focusPath(item.path);
+  if (item.type === "parent" || item.type === "d") load(item.path);
+  else if (isPreviewableImage(item)) openImagePreview(item);
+  else if (isEditableText(item)) openTextEditor(item);
+  else togglePath(item.path, !selected.has(item.path));
+});
 selectAllEl.addEventListener("change", () => {
   selected.clear();
   if (selectAllEl.checked) entries.forEach(item => selected.add(item.path));
   render();
 });
 contentEl.addEventListener("mousemove", event => {
-  const row = findRowFromTarget(event.target);
-  hoverPath(row ? row.getAttribute("data-path") : null);
+  hoverRow(findRowFromTarget(event.target));
 });
-contentEl.addEventListener("mouseleave", () => hoverPath(null));
+contentEl.addEventListener("mouseleave", () => hoverRow(null));
 contentEl.addEventListener("scroll", () => {
   hoverPaused = true;
   clearHoverPath();

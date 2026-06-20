@@ -8,8 +8,10 @@ typedef struct mime_entry {
 } mime_entry_t;
 
 static const mime_entry_t g_mimes[] = {
+  {"bmp", "image/bmp"},
   {"css", "text/css"},
   {"elf", "application/octet-stream"},
+  {"gif", "image/gif"},
   {"html", "text/html"},
   {"jpeg", "image/jpeg"},
   {"jpg", "image/jpeg"},
@@ -20,6 +22,7 @@ static const mime_entry_t g_mimes[] = {
   {"png", "image/png"},
   {"txt", "text/plain"},
   {"xml", "text/xml"},
+  {"webp", "image/webp"},
   {"zip", "application/zip"},
 };
 

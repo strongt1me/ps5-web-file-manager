@@ -27,6 +27,7 @@
 
 #define COPY_BUFFER_SIZE (8 * 1024 * 1024)
 #define TEXT_FILE_MAX_SIZE (1024 * 1024)
+#define TRANSFER_ALERT_THRESHOLD (10 * 60)
 typedef struct strbuf {
   char *data;
   size_t len;
@@ -56,9 +57,11 @@ typedef struct file_task {
   char current[PATH_MAX];
   char error[160];
   char error_code[64];
-  char error_arg[PATH_MAX];
+  char error_arg[PATH_MAX + 96];
   char **srcs;
   size_t src_count;
+  size_t file_count;
+  size_t dir_count;
   unsigned long long total;
   unsigned long long done;
   unsigned long long speed;
@@ -72,9 +75,18 @@ typedef struct file_task {
   struct file_task *next;
 } file_task_t;
 
+typedef struct task_completion {
+  unsigned long id;
+  task_op_t op;
+  unsigned long long total;
+  size_t file_count;
+  time_t elapsed;
+} task_completion_t;
+
 static pthread_mutex_t g_tasks_lock = PTHREAD_MUTEX_INITIALIZER;
 static file_task_t *g_tasks = NULL;
 static unsigned long g_next_task_id = 1;
+static task_completion_t g_last_completion;
 
 static int
 strbuf_reserve(strbuf_t *b, size_t extra) {
@@ -766,14 +778,18 @@ send_text_file(struct MHD_Connection *conn, char *data, size_t size,
 }
 
 static int count_path_bytes(file_task_t *task, const char *path,
-                            const char *display,
-                            unsigned long long *total);
+                            const char *display, const char *target,
+                            unsigned long long *total,
+                            unsigned long long *reclaimable,
+                            size_t *file_count, size_t *dir_count);
 static int task_target_path(file_task_t *task, const char *src,
                             char *out, size_t size);
 
 static int
 count_dir_bytes(file_task_t *task, const char *path, const char *display,
-                unsigned long long *total) {
+                const char *target, unsigned long long *total,
+                unsigned long long *reclaimable, size_t *file_count,
+                size_t *dir_count) {
   DIR *dir = opendir(path);
   struct dirent *entry;
   int ret = -1;
@@ -784,6 +800,7 @@ count_dir_bytes(file_task_t *task, const char *path, const char *display,
   while((entry = readdir(dir))) {
     char child[PATH_MAX];
     char display_child[PATH_MAX];
+    char target_child[PATH_MAX];
     if(!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) {
       continue;
     }
@@ -793,7 +810,11 @@ count_dir_bytes(file_task_t *task, const char *path, const char *display,
     if(path_join(child, sizeof(child), path, entry->d_name) ||
        (display && path_join(display_child, sizeof(display_child), display,
                              entry->d_name)) ||
-       count_path_bytes(task, child, display ? display_child : NULL, total)) {
+       (target && path_join(target_child, sizeof(target_child), target,
+                            entry->d_name)) ||
+       count_path_bytes(task, child, display ? display_child : NULL,
+                        target ? target_child : NULL, total, reclaimable,
+                        file_count, dir_count)) {
       goto done;
     }
   }
@@ -805,8 +826,12 @@ done:
 
 static int
 count_path_bytes(file_task_t *task, const char *path, const char *display,
-                 unsigned long long *total) {
+                 const char *target, unsigned long long *total,
+                 unsigned long long *reclaimable, size_t *file_count,
+                 size_t *dir_count) {
   struct stat st;
+  struct stat target_st;
+  int target_exists = 0;
 
   if(task && task_cancel_requested(task)) {
     return -1;
@@ -818,11 +843,25 @@ count_path_bytes(file_task_t *task, const char *path, const char *display,
   if(lstat(path, &st)) {
     return -1;
   }
+  if(target) {
+    if(!lstat(target, &target_st)) {
+      target_exists = 1;
+    } else if(errno != ENOENT) {
+      return -1;
+    }
+  }
   if(S_ISDIR(st.st_mode)) {
-    return count_dir_bytes(task, path, display, total);
+    if(dir_count) (*dir_count)++;
+    return count_dir_bytes(task, path, display,
+                           target_exists && S_ISDIR(target_st.st_mode) ? target : NULL,
+                           total, reclaimable, file_count, dir_count);
   }
   if(S_ISREG(st.st_mode)) {
     *total += (unsigned long long)st.st_size;
+    if(reclaimable && target_exists && S_ISREG(target_st.st_mode)) {
+      *reclaimable += (unsigned long long)target_st.st_size;
+    }
+    if(file_count) (*file_count)++;
   }
   return 0;
 }
@@ -988,6 +1027,7 @@ done:
 static int copy_path(file_task_t *task, const char *src, const char *dst);
 static int remove_path(file_task_t *task, const char *path);
 static int check_remove_path_writable(file_task_t *task, const char *path);
+static int mode_access(const char *path, int mode);
 
 static int
 check_remove_entry_writable(const char *path) {
@@ -996,7 +1036,7 @@ check_remove_entry_writable(const char *path) {
   if(path_dirname(path, parent, sizeof(parent))) {
     return -1;
   }
-  return access(parent, W_OK | X_OK);
+  return mode_access(parent, W_OK | X_OK);
 }
 
 static int
@@ -1005,7 +1045,7 @@ check_remove_dir_writable(file_task_t *task, const char *path) {
   struct dirent *entry;
   int ret = -1;
 
-  if(access(path, R_OK | W_OK | X_OK)) {
+  if(mode_access(path, R_OK | W_OK | X_OK)) {
     task_update(task, TASK_RUNNING, path, 0, NULL);
     return -1;
   }
@@ -1358,6 +1398,73 @@ set_error_detail(char *error, size_t error_size, char *code, size_t code_size,
   snprintf(arg, arg_size, "%s", path);
 }
 
+static void
+set_permission_error_detail(char *error, size_t error_size,
+                            char *code, size_t code_size,
+                            char *arg, size_t arg_size,
+                            const char *error_code, const char *message,
+                            const char *path) {
+  struct stat st;
+
+  set_error_detail(error, error_size, code, code_size, arg, arg_size,
+                   error_code, message, path);
+  if(!stat(path, &st)) {
+    snprintf(arg, arg_size, "%s (mode=%04o, uid=%lu, gid=%lu)", path,
+             (unsigned int)(st.st_mode & 07777),
+             (unsigned long)st.st_uid, (unsigned long)st.st_gid);
+  }
+}
+
+static int
+mode_access_stat(const struct stat *st, int mode) {
+  mode_t allowed;
+  uid_t uid = geteuid();
+
+  if(uid == 0) {
+    if(!(mode & X_OK) || !S_ISREG(st->st_mode) ||
+       (st->st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
+      return 0;
+    }
+  } else if(uid == st->st_uid) {
+    allowed = (st->st_mode >> 6) & 7;
+    if((allowed & mode) == (mode_t)mode) {
+      return 0;
+    }
+  } else {
+    gid_t gid = getegid();
+    int group_match = gid == st->st_gid;
+
+    if(!group_match) {
+      int count = getgroups(0, NULL);
+      gid_t *groups = count > 0 ? malloc((size_t)count * sizeof(*groups)) : NULL;
+
+      if(groups && getgroups(count, groups) == count) {
+        int i;
+        for(i = 0; i < count; i++) {
+          if(groups[i] == st->st_gid) {
+            group_match = 1;
+            break;
+          }
+        }
+      }
+      free(groups);
+    }
+    allowed = group_match ? (st->st_mode >> 3) & 7 : st->st_mode & 7;
+    if((allowed & mode) == (mode_t)mode) {
+      return 0;
+    }
+  }
+  errno = EACCES;
+  return -1;
+}
+
+static int
+mode_access(const char *path, int mode) {
+  struct stat st;
+
+  return stat(path, &st) ? -1 : mode_access_stat(&st, mode);
+}
+
 static int
 check_target_writable(const char *target, char *error, size_t error_size,
                       char *code, size_t code_size, char *arg, size_t arg_size) {
@@ -1366,23 +1473,20 @@ check_target_writable(const char *target, char *error, size_t error_size,
 
   if(!stat(target, &st)) {
     if(S_ISDIR(st.st_mode)) {
-      if(access(target, W_OK | X_OK)) {
-        set_error_detail(error, error_size, code, code_size, arg, arg_size,
-                         "target_dir_not_writable", "target directory is not writable", target);
+      if(mode_access_stat(&st, W_OK | X_OK)) {
+        set_permission_error_detail(error, error_size, code, code_size,
+                                    arg, arg_size, "target_dir_not_writable",
+                                    "target directory is not writable", target);
         return -1;
       }
     } else {
-      if(access(target, W_OK)) {
-        set_error_detail(error, error_size, code, code_size, arg, arg_size,
-                         "target_file_not_writable", "target file is not writable", target);
+      if(mode_access_stat(&st, W_OK)) {
+        set_permission_error_detail(error, error_size, code, code_size,
+                                    arg, arg_size, "target_file_not_writable",
+                                    "target file is not writable", target);
         return -1;
       }
-      if(path_dirname(target, parent, sizeof(parent)) ||
-         access(parent, W_OK | X_OK)) {
-        set_error_detail(error, error_size, code, code_size, arg, arg_size,
-                         "target_parent_not_writable", "target parent directory is not writable", target);
-        return -1;
-      }
+      goto check_parent;
     }
     return 0;
   }
@@ -1392,10 +1496,17 @@ check_target_writable(const char *target, char *error, size_t error_size,
                      "target_check_failed", "cannot check target path", target);
     return -1;
   }
-  if(path_dirname(target, parent, sizeof(parent)) ||
-     access(parent, W_OK | X_OK)) {
+
+check_parent:
+  if(path_dirname(target, parent, sizeof(parent))) {
     set_error_detail(error, error_size, code, code_size, arg, arg_size,
-                     "target_parent_not_writable", "target parent directory is not writable", target);
+                     "target_check_failed", "cannot check target path", target);
+    return -1;
+  }
+  if(mode_access(parent, W_OK | X_OK)) {
+    set_permission_error_detail(error, error_size, code, code_size,
+                                arg, arg_size, "target_parent_not_writable",
+                                "current directory is not writable", parent);
     return -1;
   }
   return 0;
@@ -1474,131 +1585,12 @@ task_request_error(struct MHD_Connection *conn, file_task_t *task,
   return send_json_error(conn, status, msg);
 }
 
-static int
-count_required_move_space(file_task_t *task, unsigned long long *required) {
-  size_t i;
-
-  *required = 0;
-  for(i = 0; i < task->src_count; i++) {
-    char target[PATH_MAX];
-    int needs_space;
-
-    if(task_cancel_requested(task)) {
-      return -1;
-    }
-    if(task_target_path(task, task->srcs[i], target, sizeof(target))) {
-      return -1;
-    }
-    needs_space = move_requires_space_check(task->srcs[i], target);
-    if(needs_space < 0) {
-      return -1;
-    }
-    if(needs_space && count_path_bytes(task, task->srcs[i], target, required)) {
-      return -1;
-    }
-  }
-  return 0;
-}
-
-static int count_reclaimable_bytes(file_task_t *task, const char *src,
-                                   const char *dst,
-                                   unsigned long long *reclaimable);
-
-static int
-count_reclaimable_dir_bytes(file_task_t *task, const char *src,
-                            const char *dst,
-                            unsigned long long *reclaimable) {
-  DIR *dir = opendir(src);
-  struct dirent *entry;
-  int ret = -1;
-
-  if(!dir) {
-    return -1;
-  }
-  while((entry = readdir(dir))) {
-    char src_child[PATH_MAX];
-    char dst_child[PATH_MAX];
-
-    if(!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) {
-      continue;
-    }
-    if(task_cancel_requested(task)) {
-      goto done;
-    }
-    if(path_join(src_child, sizeof(src_child), src, entry->d_name) ||
-       path_join(dst_child, sizeof(dst_child), dst, entry->d_name) ||
-       count_reclaimable_bytes(task, src_child, dst_child, reclaimable)) {
-      goto done;
-    }
-  }
-  ret = 0;
-done:
-  closedir(dir);
-  return ret;
-}
-
-static int
-count_reclaimable_bytes(file_task_t *task, const char *src, const char *dst,
-                        unsigned long long *reclaimable) {
-  struct stat src_st;
-  struct stat dst_st;
-
-  if(task_cancel_requested(task)) {
-    return -1;
-  }
-  if(lstat(src, &src_st)) {
-    return -1;
-  }
-  if(lstat(dst, &dst_st)) {
-    if(errno == ENOENT) {
-      return 0;
-    }
-    return -1;
-  }
-  if(S_ISREG(src_st.st_mode) && S_ISREG(dst_st.st_mode)) {
-    *reclaimable += (unsigned long long)dst_st.st_size;
-    return 0;
-  }
-  if(S_ISDIR(src_st.st_mode) && S_ISDIR(dst_st.st_mode)) {
-    return count_reclaimable_dir_bytes(task, src, dst, reclaimable);
-  }
-  return 0;
-}
-
-static int
-subtract_reclaimable_space(file_task_t *task, unsigned long long *required,
-                           int copy_needed_only) {
-  unsigned long long reclaimable = 0;
-  size_t i;
-
-  for(i = 0; i < task->src_count; i++) {
-    char target[PATH_MAX];
-
-    if(task_target_path(task, task->srcs[i], target, sizeof(target))) {
-      return -1;
-    }
-    if(copy_needed_only) {
-      int needs_space = move_requires_space_check(task->srcs[i], target);
-      if(needs_space < 0) {
-        return -1;
-      }
-      if(!needs_space) {
-        continue;
-      }
-    }
-    if(count_reclaimable_bytes(task, task->srcs[i], target, &reclaimable)) {
-      return -1;
-    }
-  }
-
-  *required = reclaimable >= *required ? 0 : *required - reclaimable;
-  return 0;
-}
-
 static void *
 task_worker(void *arg) {
   file_task_t *task = arg;
   unsigned long long total = 0;
+  unsigned long long required = 0;
+  unsigned long long reclaimable = 0;
   int ret = -1;
 
   task_update(task, TASK_RUNNING, "preparing", 0, NULL);
@@ -1610,7 +1602,7 @@ task_worker(void *arg) {
   if(task->op == TASK_COPY || task->op == TASK_MOVE) {
     char error[160] = {0};
     char code[64] = {0};
-    char arg[PATH_MAX] = {0};
+    char arg[PATH_MAX + 96] = {0};
 
     task_update(task, TASK_RUNNING, "checking target permissions", 0, NULL);
     if(check_task_targets_writable(task, error, sizeof(error),
@@ -1629,56 +1621,49 @@ task_worker(void *arg) {
   if(task->op == TASK_COPY || task->op == TASK_MOVE || task->op == TASK_DELETE) {
     size_t i;
     for(i = 0; i < task->src_count; i++) {
+      unsigned long long before = total;
+      int needs_space = task->op == TASK_COPY;
       char target[PATH_MAX];
-      const char *display = task->srcs[i];
+      const char *compare_target = NULL;
 
-      if((task->op == TASK_COPY || task->op == TASK_MOVE) &&
-         task_target_path(task, task->srcs[i], target, sizeof(target))) {
-        task_update(task, TASK_FAILED, task->srcs[i], 0, strerror(errno));
-        return NULL;
-      }
       if(task->op == TASK_COPY || task->op == TASK_MOVE) {
-        display = target;
+        if(task_target_path(task, task->srcs[i], target, sizeof(target))) {
+          task_update(task, TASK_FAILED, task->srcs[i], 0, strerror(errno));
+          return NULL;
+        }
       }
-      if(count_path_bytes(task, task->srcs[i], display, &total)) {
+      if(task->op == TASK_MOVE) {
+        needs_space = move_requires_space_check(task->srcs[i], target);
+        if(needs_space < 0) {
+          task_update(task, TASK_FAILED, task->srcs[i], 0, strerror(errno));
+          return NULL;
+        }
+      }
+      if(needs_space) {
+        compare_target = target;
+      }
+      if(count_path_bytes(task, task->srcs[i], task->srcs[i], compare_target,
+                          &total, &reclaimable,
+                          &task->file_count, &task->dir_count)) {
         if(errno == ECANCELED || task_cancel_requested(task)) {
-          task_update(task, TASK_CANCELED, display, 0, "canceled");
+          task_update(task, TASK_CANCELED, task->srcs[i], 0, "canceled");
         } else {
-          task_update(task, TASK_FAILED, display, 0, strerror(errno));
+          task_update(task, TASK_FAILED, task->srcs[i], 0, strerror(errno));
         }
         return NULL;
       }
+      if(needs_space) {
+        required += total - before;
+      }
     }
     task_set_total(task, total);
+    required = reclaimable >= required ? 0 : required - reclaimable;
 
     if(task->op == TASK_COPY || task->op == TASK_MOVE) {
-      unsigned long long required = task->op == TASK_COPY ? total : 0;
       char error[128] = {0};
       char code[64] = {0};
       char arg[PATH_MAX] = {0};
 
-      task_update(task, TASK_RUNNING, "checking target space", 0, NULL);
-      if(task->op == TASK_MOVE && count_required_move_space(task, &required)) {
-        if(errno == ECANCELED || task_cancel_requested(task)) {
-          task_update(task, TASK_CANCELED, task->current[0] ? task->current : task->src,
-                      0, "canceled");
-        } else {
-          task_update(task, TASK_FAILED, task->current[0] ? task->current : task->src,
-                      0, strerror(errno));
-        }
-        return NULL;
-      }
-      if(required &&
-         subtract_reclaimable_space(task, &required, task->op == TASK_MOVE)) {
-        if(errno == ECANCELED || task_cancel_requested(task)) {
-          task_update(task, TASK_CANCELED, task->current[0] ? task->current : task->src,
-                      0, "canceled");
-        } else {
-          task_update(task, TASK_FAILED, task->current[0] ? task->current : task->src,
-                      0, strerror(errno));
-        }
-        return NULL;
-      }
       if(check_target_space(task->dst, required, error, sizeof(error),
                             code, sizeof(code), arg, sizeof(arg))) {
         task_set_error_code(task, code, arg);
@@ -1730,12 +1715,21 @@ task_worker(void *arg) {
                   0, strerror(errno));
     }
   } else {
+    time_t completed_at = time(NULL);
     pthread_mutex_lock(&g_tasks_lock);
     task->state = TASK_DONE;
     if(task->total) {
       task->done = task->total;
     }
-    task->updated_at = time(NULL);
+    task->updated_at = completed_at;
+    if((task->op == TASK_COPY || task->op == TASK_MOVE) &&
+       completed_at - task->created_at >= TRANSFER_ALERT_THRESHOLD) {
+      g_last_completion.id = task->id;
+      g_last_completion.op = task->op;
+      g_last_completion.total = task->total;
+      g_last_completion.file_count = task->dir_count ? task->file_count : 0;
+      g_last_completion.elapsed = completed_at - task->created_at;
+    }
     pthread_mutex_unlock(&g_tasks_lock);
   }
 
@@ -1919,9 +1913,19 @@ api_tasks(struct MHD_Connection *conn) {
                   task->transfer_started_at ? (long long)(time(NULL) - task->transfer_started_at) : 0LL,
                   (long long)task->updated_at);
   }
+  strbuf_append(&b, "],\"completion\":");
+  if(g_last_completion.id) {
+    strbuf_printf(&b, "{\"id\":%lu,\"op\":\"%s\",\"elapsed\":%lld,"
+                  "\"total\":%llu,\"file_count\":%zu}",
+                  g_last_completion.id, task_op_name(g_last_completion.op),
+                  (long long)g_last_completion.elapsed,
+                  g_last_completion.total, g_last_completion.file_count);
+  } else {
+    strbuf_append(&b, "null");
+  }
   remove_finished_tasks_locked();
   pthread_mutex_unlock(&g_tasks_lock);
-  strbuf_append(&b, "]}");
+  strbuf_append(&b, "}");
   return send_buffer(conn, MHD_HTTP_OK, b.data, "application/json");
 }
 
@@ -2209,7 +2213,7 @@ api_text_create(struct MHD_Connection *conn) {
     free(path); free(name);
     return send_json_error(conn, MHD_HTTP_BAD_REQUEST, "invalid path");
   }
-  if(access(path, W_OK | X_OK)) {
+  if(mode_access(path, W_OK | X_OK)) {
     free(path); free(name);
     return send_json_error(conn, MHD_HTTP_FORBIDDEN,
                            "text file is not writable");
@@ -2330,7 +2334,7 @@ api_text_save(struct MHD_Connection *conn, const char *body,
                            "file changed since it was opened");
   }
   if(path_dirname(path, parent, sizeof(parent)) ||
-     access(path, W_OK) || access(parent, W_OK | X_OK)) {
+     mode_access(path, W_OK) || mode_access(parent, W_OK | X_OK)) {
     free(current);
     free(path); free(expected);
     return send_json_error(conn, MHD_HTTP_FORBIDDEN,
