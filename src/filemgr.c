@@ -26,6 +26,10 @@
 #include "websrv.h"
 
 #define COPY_BUFFER_SIZE (8 * 1024 * 1024)
+#define COPY_PIPELINE_SLOTS 3
+#define SMALL_COPY_WORKERS 2
+#define SMALL_COPY_QUEUE_LIMIT 128
+#define LARGE_FILE_THRESHOLD (256LL * 1024 * 1024)
 #define TEXT_FILE_MAX_SIZE (1024 * 1024)
 #define TRANSFER_ALERT_THRESHOLD (10 * 60)
 typedef struct strbuf {
@@ -82,6 +86,49 @@ typedef struct task_completion {
   size_t file_count;
   time_t elapsed;
 } task_completion_t;
+
+typedef struct copy_pipeline_slot {
+  char *data;
+  size_t size;
+  int ready;
+} copy_pipeline_slot_t;
+
+typedef struct copy_pipeline {
+  file_task_t *task;
+  int in;
+  copy_pipeline_slot_t slots[COPY_PIPELINE_SLOTS];
+  pthread_mutex_t lock;
+  pthread_cond_t can_read;
+  pthread_cond_t can_write;
+  int read_index;
+  int write_index;
+  int done;
+  int error;
+  int error_number;
+} copy_pipeline_t;
+
+typedef struct copy_job {
+  char src[PATH_MAX];
+  char dst[PATH_MAX];
+  struct copy_job *next;
+} copy_job_t;
+
+typedef struct copy_queue {
+  file_task_t *task;
+  pthread_mutex_t lock;
+  pthread_cond_t has_work;
+  pthread_cond_t has_space;
+  pthread_cond_t idle;
+  pthread_t workers[SMALL_COPY_WORKERS];
+  copy_job_t *head;
+  copy_job_t *tail;
+  int queued;
+  int active;
+  int stopping;
+  int error;
+  int error_number;
+  int worker_count;
+} copy_queue_t;
 
 static pthread_mutex_t g_tasks_lock = PTHREAD_MUTEX_INITIALIZER;
 static file_task_t *g_tasks = NULL;
@@ -935,38 +982,7 @@ fchmod_0777(int fd) {
 }
 
 static int
-chmod_tree_0777(const char *path) {
-  struct stat st;
-
-  if(lstat(path, &st)) {
-    return -1;
-  }
-  if(S_ISDIR(st.st_mode)) {
-    DIR *dir = opendir(path);
-    struct dirent *entry;
-    if(!dir) {
-      return -1;
-    }
-    while((entry = readdir(dir))) {
-      char child[PATH_MAX];
-      if(!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) {
-        continue;
-      }
-      if(path_join(child, sizeof(child), path, entry->d_name) ||
-         chmod_tree_0777(child)) {
-        closedir(dir);
-        return -1;
-      }
-    }
-    closedir(dir);
-  } else if(!S_ISREG(st.st_mode)) {
-    return 0;
-  }
-  return chmod_path_0777(path);
-}
-
-static int
-copy_file(file_task_t *task, const char *src, const char *dst, mode_t mode) {
+copy_file_buffered(file_task_t *task, const char *src, const char *dst) {
   char *buf = NULL;
   int in = -1;
   int out = -1;
@@ -981,7 +997,6 @@ copy_file(file_task_t *task, const char *src, const char *dst, mode_t mode) {
   if((in = open(src, O_RDONLY)) < 0) {
     goto done;
   }
-  (void)mode;
   if((out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0777)) < 0) {
     goto done;
   }
@@ -1022,6 +1037,196 @@ done:
   }
   if(ret) unlink(dst);
   return ret;
+}
+
+static void
+pipeline_fail_locked(copy_pipeline_t *p, int error) {
+  p->error = 1;
+  p->done = 1;
+  p->error_number = error ? error : EIO;
+  pthread_cond_broadcast(&p->can_read);
+  pthread_cond_broadcast(&p->can_write);
+}
+
+static void *
+copy_pipeline_reader(void *arg) {
+  copy_pipeline_t *p = arg;
+
+  for(;;) {
+    int slot;
+    ssize_t n;
+
+    pthread_mutex_lock(&p->lock);
+    while(!p->error && !p->done && p->slots[p->read_index].ready) {
+      pthread_cond_wait(&p->can_read, &p->lock);
+    }
+    if(p->error || p->done || task_cancel_requested(p->task)) {
+      p->done = 1;
+      pthread_cond_broadcast(&p->can_write);
+      pthread_mutex_unlock(&p->lock);
+      return NULL;
+    }
+    slot = p->read_index;
+    p->read_index = (p->read_index + 1) % COPY_PIPELINE_SLOTS;
+    pthread_mutex_unlock(&p->lock);
+
+    n = read(p->in, p->slots[slot].data, COPY_BUFFER_SIZE);
+
+    pthread_mutex_lock(&p->lock);
+    if(n < 0) {
+      pipeline_fail_locked(p, errno);
+    } else if(n == 0) {
+      p->done = 1;
+      pthread_cond_broadcast(&p->can_write);
+    } else {
+      p->slots[slot].size = (size_t)n;
+      p->slots[slot].ready = 1;
+      pthread_cond_signal(&p->can_write);
+    }
+    pthread_mutex_unlock(&p->lock);
+  }
+}
+
+static int
+copy_file_pipeline(file_task_t *task, const char *src, const char *dst) {
+  copy_pipeline_t p;
+  pthread_t reader;
+  int out = -1;
+  int ret = -1;
+  int reader_started = 0;
+  int lock_ready = 0;
+  int can_read_ready = 0;
+  int can_write_ready = 0;
+  int i;
+
+  memset(&p, 0, sizeof(p));
+  p.task = task;
+  p.in = -1;
+  task_update(task, TASK_RUNNING, dst, 0, NULL);
+
+  if(task_cancel_requested(task)) {
+    errno = ECANCELED;
+    return -1;
+  }
+  if((p.in = open(src, O_RDONLY)) < 0) {
+    goto done;
+  }
+  if((out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0777)) < 0) {
+    goto done;
+  }
+  if(pthread_mutex_init(&p.lock, NULL)) {
+    errno = EAGAIN;
+    goto done;
+  }
+  lock_ready = 1;
+  if(pthread_cond_init(&p.can_read, NULL)) {
+    errno = EAGAIN;
+    goto done;
+  }
+  can_read_ready = 1;
+  if(pthread_cond_init(&p.can_write, NULL)) {
+    errno = EAGAIN;
+    goto done;
+  }
+  can_write_ready = 1;
+  for(i = 0; i < COPY_PIPELINE_SLOTS; i++) {
+    if(posix_memalign((void **)&p.slots[i].data, 4096, COPY_BUFFER_SIZE)) {
+      errno = ENOMEM;
+      goto done;
+    }
+  }
+  if(pthread_create(&reader, NULL, copy_pipeline_reader, &p)) {
+    errno = EAGAIN;
+    goto done;
+  }
+  reader_started = 1;
+
+  for(;;) {
+    int slot;
+    char *buf;
+    size_t size;
+    size_t off = 0;
+
+    pthread_mutex_lock(&p.lock);
+    while(!p.error && !p.done && !p.slots[p.write_index].ready) {
+      pthread_cond_wait(&p.can_write, &p.lock);
+    }
+    if(p.error) {
+      errno = p.error_number;
+      pthread_mutex_unlock(&p.lock);
+      goto done;
+    }
+    if(p.done && !p.slots[p.write_index].ready) {
+      pthread_mutex_unlock(&p.lock);
+      break;
+    }
+    slot = p.write_index;
+    buf = p.slots[slot].data;
+    size = p.slots[slot].size;
+    pthread_mutex_unlock(&p.lock);
+
+    while(off < size) {
+      ssize_t n;
+      if(task_cancel_requested(task)) {
+        errno = ECANCELED;
+        goto done;
+      }
+      n = write(out, buf + off, size - off);
+      if(n <= 0) {
+        if(!n) errno = EIO;
+        goto done;
+      }
+      off += (size_t)n;
+      task_update(task, TASK_RUNNING, dst, (unsigned long long)n, NULL);
+    }
+
+    pthread_mutex_lock(&p.lock);
+    p.slots[slot].ready = 0;
+    p.write_index = (p.write_index + 1) % COPY_PIPELINE_SLOTS;
+    pthread_cond_signal(&p.can_read);
+    pthread_mutex_unlock(&p.lock);
+  }
+
+  if(fchmod_0777(out)) {
+    goto done;
+  }
+  ret = 0;
+
+done:
+  if(reader_started) {
+    pthread_mutex_lock(&p.lock);
+    p.done = 1;
+    p.error = 1;
+    pthread_cond_broadcast(&p.can_read);
+    pthread_cond_broadcast(&p.can_write);
+    pthread_mutex_unlock(&p.lock);
+    pthread_join(reader, NULL);
+  }
+  for(i = 0; i < COPY_PIPELINE_SLOTS; i++) {
+    free(p.slots[i].data);
+  }
+  if(can_write_ready) pthread_cond_destroy(&p.can_write);
+  if(can_read_ready) pthread_cond_destroy(&p.can_read);
+  if(lock_ready) pthread_mutex_destroy(&p.lock);
+  if(p.in >= 0) close(p.in);
+  if(out >= 0) {
+    if(close(out)) ret = -1;
+  }
+  if(ret) unlink(dst);
+  return ret;
+}
+
+static int
+copy_file(file_task_t *task, const char *src, const char *dst) {
+  struct stat st;
+
+  if(lstat(src, &st)) {
+    return -1;
+  }
+  if(st.st_size >= LARGE_FILE_THRESHOLD) {
+    return copy_file_pipeline(task, src, dst);
+  }
+  return copy_file_buffered(task, src, dst);
 }
 
 static int copy_path(file_task_t *task, const char *src, const char *dst);
@@ -1095,15 +1300,11 @@ check_remove_path_writable(file_task_t *task, const char *path) {
 }
 
 static int
-finish_copied_move(file_task_t *task, const char *src, const char *dst) {
+finish_copied_move(file_task_t *task, const char *src) {
   int ret;
 
-  task_finish_bytes(task, "setting permissions");
-  ret = chmod_tree_0777(dst);
-  if(!ret) {
-    task_finish_bytes(task, "checking source permissions");
-    ret = check_remove_path_writable(task, src);
-  }
+  task_finish_bytes(task, "checking source permissions");
+  ret = check_remove_path_writable(task, src);
   if(!ret) {
     task_finish_bytes(task, "removing source");
     ret = remove_path(task, src);
@@ -1111,14 +1312,206 @@ finish_copied_move(file_task_t *task, const char *src, const char *dst) {
   return ret;
 }
 
+static int copy_dir_queued(file_task_t *task, const char *src, const char *dst,
+                           copy_queue_t *queue);
+
+static void *
+copy_queue_worker(void *arg) {
+  copy_queue_t *queue = arg;
+
+  for(;;) {
+    copy_job_t *job;
+    int ret;
+
+    pthread_mutex_lock(&queue->lock);
+    while(!queue->stopping && !queue->head) {
+      pthread_cond_wait(&queue->has_work, &queue->lock);
+    }
+    if(queue->stopping && !queue->head) {
+      pthread_mutex_unlock(&queue->lock);
+      return NULL;
+    }
+    job = queue->head;
+    queue->head = job->next;
+    if(!queue->head) {
+      queue->tail = NULL;
+    }
+    queue->queued--;
+    queue->active++;
+    pthread_cond_signal(&queue->has_space);
+    pthread_mutex_unlock(&queue->lock);
+
+    ret = task_cancel_requested(queue->task) ? -1 :
+      copy_file_buffered(queue->task, job->src, job->dst);
+    if(ret && task_cancel_requested(queue->task)) {
+      errno = ECANCELED;
+    }
+
+    pthread_mutex_lock(&queue->lock);
+    if(ret) {
+      queue->error = 1;
+      queue->error_number = errno ? errno : EIO;
+      queue->stopping = 1;
+      pthread_cond_broadcast(&queue->has_work);
+      pthread_cond_broadcast(&queue->has_space);
+    }
+    queue->active--;
+    if(!queue->head && !queue->active) {
+      pthread_cond_broadcast(&queue->idle);
+    }
+    pthread_mutex_unlock(&queue->lock);
+    free(job);
+  }
+}
+
 static int
-copy_dir(file_task_t *task, const char *src, const char *dst, mode_t mode) {
+copy_queue_init(copy_queue_t *queue, file_task_t *task) {
+  int i;
+
+  memset(queue, 0, sizeof(*queue));
+  queue->task = task;
+  if(pthread_mutex_init(&queue->lock, NULL)) {
+    return -1;
+  }
+  if(pthread_cond_init(&queue->has_work, NULL)) {
+    pthread_mutex_destroy(&queue->lock);
+    return -1;
+  }
+  if(pthread_cond_init(&queue->has_space, NULL)) {
+    pthread_cond_destroy(&queue->has_work);
+    pthread_mutex_destroy(&queue->lock);
+    return -1;
+  }
+  if(pthread_cond_init(&queue->idle, NULL)) {
+    pthread_cond_destroy(&queue->has_space);
+    pthread_cond_destroy(&queue->has_work);
+    pthread_mutex_destroy(&queue->lock);
+    return -1;
+  }
+  for(i = 0; i < SMALL_COPY_WORKERS; i++) {
+    if(pthread_create(&queue->workers[i], NULL, copy_queue_worker, queue)) {
+      queue->stopping = 1;
+      pthread_cond_broadcast(&queue->has_work);
+      while(queue->worker_count > 0) {
+        pthread_join(queue->workers[--queue->worker_count], NULL);
+      }
+      pthread_cond_destroy(&queue->idle);
+      pthread_cond_destroy(&queue->has_space);
+      pthread_cond_destroy(&queue->has_work);
+      pthread_mutex_destroy(&queue->lock);
+      return -1;
+    }
+    queue->worker_count++;
+  }
+  return 0;
+}
+
+static int
+copy_queue_enqueue(copy_queue_t *queue, const char *src, const char *dst) {
+  copy_job_t *job;
+
+  if(!(job = calloc(1, sizeof(*job)))) {
+    return -1;
+  }
+  snprintf(job->src, sizeof(job->src), "%s", src);
+  snprintf(job->dst, sizeof(job->dst), "%s", dst);
+
+  pthread_mutex_lock(&queue->lock);
+  while(!queue->stopping && queue->queued >= SMALL_COPY_QUEUE_LIMIT) {
+    pthread_cond_wait(&queue->has_space, &queue->lock);
+  }
+  if(queue->stopping || queue->error || task_cancel_requested(queue->task)) {
+    pthread_mutex_unlock(&queue->lock);
+    free(job);
+    errno = queue->error_number ? queue->error_number : ECANCELED;
+    return -1;
+  }
+  if(queue->tail) {
+    queue->tail->next = job;
+  } else {
+    queue->head = job;
+  }
+  queue->tail = job;
+  queue->queued++;
+  pthread_cond_signal(&queue->has_work);
+  pthread_mutex_unlock(&queue->lock);
+  return 0;
+}
+
+static int
+copy_queue_wait(copy_queue_t *queue) {
+  int ret = 0;
+
+  pthread_mutex_lock(&queue->lock);
+  while(!queue->error && (queue->head || queue->active)) {
+    pthread_cond_wait(&queue->idle, &queue->lock);
+  }
+  if(queue->error) {
+    errno = queue->error_number ? queue->error_number : EIO;
+    ret = -1;
+  }
+  pthread_mutex_unlock(&queue->lock);
+  return ret;
+}
+
+static int
+copy_queue_finish(copy_queue_t *queue, int abort_pending) {
+  copy_job_t *job;
+  int ret = abort_pending ? -1 : copy_queue_wait(queue);
+  int i;
+
+  pthread_mutex_lock(&queue->lock);
+  queue->stopping = 1;
+  if(abort_pending) {
+    while(queue->head) {
+      job = queue->head;
+      queue->head = job->next;
+      free(job);
+    }
+    queue->tail = NULL;
+    queue->queued = 0;
+  }
+  pthread_cond_broadcast(&queue->has_work);
+  pthread_cond_broadcast(&queue->has_space);
+  pthread_mutex_unlock(&queue->lock);
+  for(i = 0; i < queue->worker_count; i++) {
+    pthread_join(queue->workers[i], NULL);
+  }
+  while(queue->head) {
+    job = queue->head;
+    queue->head = job->next;
+    free(job);
+  }
+  pthread_cond_destroy(&queue->idle);
+  pthread_cond_destroy(&queue->has_space);
+  pthread_cond_destroy(&queue->has_work);
+  pthread_mutex_destroy(&queue->lock);
+  return ret;
+}
+
+static int
+copy_dir(file_task_t *task, const char *src, const char *dst) {
+  copy_queue_t queue;
+  int ret;
+
+  if(copy_queue_init(&queue, task)) {
+    return -1;
+  }
+  ret = copy_dir_queued(task, src, dst, &queue);
+  if(copy_queue_finish(&queue, ret)) {
+    ret = -1;
+  }
+  return ret;
+}
+
+static int
+copy_dir_queued(file_task_t *task, const char *src, const char *dst,
+                copy_queue_t *queue) {
   DIR *dir;
   struct dirent *entry;
-  int created = 0;
+  struct stat dst_st;
   int ret = -1;
 
-  (void)mode;
   task_update(task, TASK_RUNNING, dst, 0, NULL);
 
   if(task_cancel_requested(task)) {
@@ -1128,10 +1521,15 @@ copy_dir(file_task_t *task, const char *src, const char *dst, mode_t mode) {
     if(errno != EEXIST) {
       return -1;
     }
-  } else {
-    created = 1;
+    if(lstat(dst, &dst_st)) {
+      return -1;
+    }
+    if(!S_ISDIR(dst_st.st_mode)) {
+      errno = ENOTDIR;
+      return -1;
+    }
   }
-  if(created && chmod_path_0777(dst)) {
+  if(chmod_path_0777(dst)) {
     return -1;
   }
   if(!(dir = opendir(src))) {
@@ -1149,8 +1547,26 @@ copy_dir(file_task_t *task, const char *src, const char *dst, mode_t mode) {
       goto done;
     }
     if(path_join(from, sizeof(from), src, entry->d_name) ||
-       path_join(to, sizeof(to), dst, entry->d_name) ||
-       copy_path(task, from, to)) {
+       path_join(to, sizeof(to), dst, entry->d_name)) {
+      goto done;
+    }
+    if(lstat(from, &dst_st)) {
+      goto done;
+    }
+    if(S_ISDIR(dst_st.st_mode)) {
+      if(copy_dir_queued(task, from, to, queue)) {
+        goto done;
+      }
+    } else if(S_ISREG(dst_st.st_mode)) {
+      if(dst_st.st_size >= LARGE_FILE_THRESHOLD) {
+        if(copy_queue_wait(queue) || copy_file_pipeline(task, from, to)) {
+          goto done;
+        }
+      } else if(copy_queue_enqueue(queue, from, to)) {
+        goto done;
+      }
+    } else {
+      errno = ENOTSUP;
       goto done;
     }
   }
@@ -1169,10 +1585,10 @@ copy_path(file_task_t *task, const char *src, const char *dst) {
     return -1;
   }
   if(S_ISDIR(st.st_mode)) {
-    return copy_dir(task, src, dst, st.st_mode & 0777);
+    return copy_dir(task, src, dst);
   }
   if(S_ISREG(st.st_mode)) {
-    return copy_file(task, src, dst, st.st_mode & 0777);
+    return copy_file(task, src, dst);
   }
   errno = ENOTSUP;
   return -1;
@@ -1194,19 +1610,16 @@ move_path(file_task_t *task, const char *src, const char *dst) {
   if(dst_exists && S_ISDIR(src_st.st_mode) && S_ISDIR(dst_st.st_mode)) {
     ret = copy_path(task, src, dst);
     if(!ret) {
-      ret = finish_copied_move(task, src, dst);
+      ret = finish_copied_move(task, src);
     }
     return ret;
   }
 
   ret = rename(src, dst);
-  if(!ret) {
-    task_finish_bytes(task, "setting permissions");
-    (void)chmod_tree_0777(dst);
-  } else if(errno == EXDEV) {
+  if(ret && errno == EXDEV) {
     ret = copy_path(task, src, dst);
     if(!ret) {
-      ret = finish_copied_move(task, src, dst);
+      ret = finish_copied_move(task, src);
     }
   }
   return ret;
@@ -1466,6 +1879,51 @@ mode_access(const char *path, int mode) {
 }
 
 static int
+probe_dir_writable(const char *path) {
+  char name[80];
+  char probe[PATH_MAX];
+  int attempt;
+
+  for(attempt = 0; attempt < 16; attempt++) {
+    int fd;
+    int error = 0;
+
+    snprintf(name, sizeof(name), ".web-file-mgr-%ld-%lld-%d.tmp",
+             (long)getpid(), (long long)time(NULL), attempt);
+    if(path_join(probe, sizeof(probe), path, name)) {
+      return -1;
+    }
+    fd = open(probe, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if(fd < 0) {
+      if(errno == EEXIST) {
+        continue;
+      }
+      return -1;
+    }
+    if(close(fd)) {
+      error = errno;
+    }
+    if(unlink(probe) && !error) {
+      error = errno;
+    }
+    if(error) {
+      errno = error;
+      return -1;
+    }
+    return 0;
+  }
+  errno = EEXIST;
+  return -1;
+}
+
+static int
+probe_file_writable(const char *path) {
+  int fd = open(path, O_WRONLY);
+
+  return fd < 0 ? -1 : close(fd);
+}
+
+static int
 check_target_writable(const char *target, char *error, size_t error_size,
                       char *code, size_t code_size, char *arg, size_t arg_size) {
   struct stat st;
@@ -1473,14 +1931,14 @@ check_target_writable(const char *target, char *error, size_t error_size,
 
   if(!stat(target, &st)) {
     if(S_ISDIR(st.st_mode)) {
-      if(mode_access_stat(&st, W_OK | X_OK)) {
+      if(probe_dir_writable(target)) {
         set_permission_error_detail(error, error_size, code, code_size,
                                     arg, arg_size, "target_dir_not_writable",
                                     "target directory is not writable", target);
         return -1;
       }
     } else {
-      if(mode_access_stat(&st, W_OK)) {
+      if(probe_file_writable(target)) {
         set_permission_error_detail(error, error_size, code, code_size,
                                     arg, arg_size, "target_file_not_writable",
                                     "target file is not writable", target);
@@ -1503,7 +1961,7 @@ check_parent:
                      "target_check_failed", "cannot check target path", target);
     return -1;
   }
-  if(mode_access(parent, W_OK | X_OK)) {
+  if(probe_dir_writable(parent)) {
     set_permission_error_detail(error, error_size, code, code_size,
                                 arg, arg_size, "target_parent_not_writable",
                                 "current directory is not writable", parent);
@@ -1638,6 +2096,9 @@ task_worker(void *arg) {
           task_update(task, TASK_FAILED, task->srcs[i], 0, strerror(errno));
           return NULL;
         }
+        if(!needs_space) {
+          continue;
+        }
       }
       if(needs_space) {
         compare_target = target;
@@ -1648,6 +2109,9 @@ task_worker(void *arg) {
         if(errno == ECANCELED || task_cancel_requested(task)) {
           task_update(task, TASK_CANCELED, task->srcs[i], 0, "canceled");
         } else {
+          if(errno == ENAMETOOLONG) {
+            task_set_error_code(task, "path_too_long", NULL);
+          }
           task_update(task, TASK_FAILED, task->srcs[i], 0, strerror(errno));
         }
         return NULL;

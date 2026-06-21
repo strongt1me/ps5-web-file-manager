@@ -20,7 +20,7 @@ let textEditorOriginal = "";
 let textEditorBusy = false;
 let L = {};
 
-const APP_VERSION = "v0.4";
+const APP_VERSION = "v0.5";
 const LAST_PATH_KEY = "ps5-web-file-mgr:last-path";
 const DIRECTORY_LOADING_DELAY = 250;
 
@@ -50,6 +50,7 @@ const textEditorCloseBtn = document.getElementById("textEditorCloseBtn");
 const textEditorSaveBtn = document.getElementById("textEditorSaveBtn");
 const newTextBtn = document.getElementById("newTextBtn");
 const imagePreviewOverlayEl = document.getElementById("imagePreviewOverlay");
+const imagePreviewNameEl = document.getElementById("imagePreviewName");
 const imagePreviewEl = document.getElementById("imagePreview");
 const imagePreviewCloseBtn = document.getElementById("imagePreviewCloseBtn");
 
@@ -174,9 +175,9 @@ function formatDuration(seconds) {
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
   const secs = seconds % 60;
-  if (hours) return hours + "h " + minutes + "m";
-  if (minutes) return minutes + "m " + secs + "s";
-  return secs + "s";
+  if (hours) return t("durationHours", { hours, minutes });
+  if (minutes) return t("durationMinutes", { minutes, seconds: secs });
+  return t("durationSeconds", { seconds: secs });
 }
 
 function averageEta(task, done, total) {
@@ -184,6 +185,11 @@ function averageEta(task, done, total) {
   const elapsed = Math.max(1, Number(task.elapsed || 0));
   const averageSpeed = done / elapsed;
   return averageSpeed > 0 ? formatDuration((total - done) / averageSpeed) : "--";
+}
+
+function taskElapsed(task) {
+  const created = Number(task.created_at || 0);
+  return created ? formatDuration(Date.now() / 1000 - created) : "--";
 }
 
 function opLabel(op) {
@@ -330,6 +336,8 @@ function isPreviewableImage(item) {
 
 function openImagePreview(item) {
   if (busy) return;
+  imagePreviewNameEl.textContent = item.name;
+  imagePreviewNameEl.title = item.name;
   imagePreviewEl.src = "/fs?path=" + encodeURIComponent(item.path);
   imagePreviewOverlayEl.hidden = false;
   imagePreviewCloseBtn.focus();
@@ -337,6 +345,8 @@ function openImagePreview(item) {
 
 function closeImagePreview() {
   imagePreviewOverlayEl.hidden = true;
+  imagePreviewNameEl.textContent = "";
+  imagePreviewNameEl.title = "";
   imagePreviewEl.removeAttribute("src");
 }
 
@@ -487,10 +497,7 @@ function renderTaskName(el, task) {
   subject.className = "task-name-subject";
   subject.textContent = target;
   subject.title = target;
-  const state = document.createElement("span");
-  state.className = "task-name-state";
-  state.textContent = stateLabel(task.state);
-  appendChildren(el, op, subject, state);
+  appendChildren(el, op, subject);
 }
 
 function renderClipboard() {
@@ -875,6 +882,29 @@ function showPendingOverlay(text) {
   setBusy(true);
 }
 
+function renderTaskPath(element, path) {
+  element.title = path;
+  element.textContent = path;
+  if (element.scrollWidth <= element.clientWidth) return;
+
+  let low = 0;
+  let high = path.length;
+  while (low < high) {
+    const count = Math.ceil((low + high) / 2);
+    const left = Math.ceil(count / 2);
+    const right = Math.floor(count / 2);
+    element.textContent = path.slice(0, left) + "..." +
+      (right ? path.slice(-right) : "");
+    if (element.scrollWidth <= element.clientWidth) low = count;
+    else high = count - 1;
+  }
+
+  const left = Math.ceil(low / 2);
+  const right = Math.floor(low / 2);
+  element.textContent = path.slice(0, left) + "..." +
+    (right ? path.slice(-right) : "");
+}
+
 async function actionPaste() {
   if (busy || loadingPath || !clipboard || clipboard.items.length === 0) return;
   const op = clipboard.op;
@@ -959,10 +989,18 @@ function renderTasks(tasks) {
   name.className = "task-name";
   renderTaskName(name, task);
   head.appendChild(name);
+  const elapsed = document.createElement("div");
+  elapsed.className = "task-elapsed";
+  elapsed.textContent = t("elapsedLabel") + ": " + taskElapsed(task);
+  head.appendChild(elapsed);
 
   const current = document.createElement("div");
   current.className = "task-current";
-  current.textContent = task.error || task.current || task.src;
+  if (task.error) {
+    current.className += " task-current-plain";
+    current.textContent = task.error;
+  }
+  else current.textContent = task.current || task.src;
 
   const meta = document.createElement("div");
   meta.className = "task-meta";
@@ -1002,6 +1040,7 @@ function renderTasks(tasks) {
   else if (total && !isFinishing) appendChildren(div, head, current, meta, progress, cancel);
   else appendChildren(div, head, current, progress, cancel);
   tasksEl.appendChild(div);
+  if (!task.error) renderTaskPath(current, task.current || task.src);
 }
 
 async function pollTasks() {
