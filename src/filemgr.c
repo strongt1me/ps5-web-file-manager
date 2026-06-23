@@ -27,11 +27,15 @@
 
 #define COPY_BUFFER_SIZE (8 * 1024 * 1024)
 #define COPY_PIPELINE_SLOTS 3
-#define SMALL_COPY_WORKERS 2
-#define SMALL_COPY_QUEUE_LIMIT 128
+#define FILEMGR_AGGRESSIVE_COPY 0
+#define FILEMGR_PIPELINE_COPY 1
+#define SMALL_COPY_WORKERS 3
+#define FILE_TASK_QUEUE_LIMIT 128
 #define LARGE_FILE_THRESHOLD (256LL * 1024 * 1024)
 #define TEXT_FILE_MAX_SIZE (1024 * 1024)
 #define TRANSFER_ALERT_THRESHOLD (10 * 60)
+#define ETA_AVERAGE_WINDOW_SECONDS 30
+#define ETA_SAMPLE_SLOTS 64
 typedef struct strbuf {
   char *data;
   size_t len;
@@ -52,6 +56,11 @@ typedef enum task_state {
   TASK_CANCELED,
 } task_state_t;
 
+typedef struct task_eta_sample {
+  unsigned long long done;
+  struct timespec time;
+} task_eta_sample_t;
+
 typedef struct file_task {
   unsigned long id;
   task_op_t op;
@@ -69,8 +78,12 @@ typedef struct file_task {
   unsigned long long total;
   unsigned long long done;
   unsigned long long speed;
+  unsigned long long eta;
   unsigned long long speed_sample_done;
   struct timespec speed_sample_time;
+  task_eta_sample_t eta_samples[ETA_SAMPLE_SLOTS];
+  unsigned int eta_sample_next;
+  unsigned int eta_sample_count;
   int cancel_requested;
   time_t created_at;
   time_t transfer_started_at;
@@ -82,11 +95,14 @@ typedef struct file_task {
 typedef struct task_completion {
   unsigned long id;
   task_op_t op;
+  char src[PATH_MAX];
+  size_t src_count;
   unsigned long long total;
   size_t file_count;
   time_t elapsed;
 } task_completion_t;
 
+#if FILEMGR_PIPELINE_COPY
 typedef struct copy_pipeline_slot {
   char *data;
   size_t size;
@@ -106,7 +122,9 @@ typedef struct copy_pipeline {
   int error;
   int error_number;
 } copy_pipeline_t;
+#endif
 
+#if FILEMGR_AGGRESSIVE_COPY
 typedef struct copy_job {
   char src[PATH_MAX];
   char dst[PATH_MAX];
@@ -129,6 +147,7 @@ typedef struct copy_queue {
   int error_number;
   int worker_count;
 } copy_queue_t;
+#endif
 
 static pthread_mutex_t g_tasks_lock = PTHREAD_MUTEX_INITIALIZER;
 static file_task_t *g_tasks = NULL;
@@ -422,6 +441,62 @@ task_cancel_requested(file_task_t *task) {
   return cancel;
 }
 
+static long long
+timespec_delta_ns(const struct timespec *end, const struct timespec *start) {
+  return (long long)(end->tv_sec - start->tv_sec) * 1000000000LL +
+         (long long)(end->tv_nsec - start->tv_nsec);
+}
+
+static void
+task_update_eta_locked(file_task_t *task, const struct timespec *now_mono) {
+  task_eta_sample_t *sample;
+  task_eta_sample_t *base = NULL;
+  unsigned int i;
+
+  if(!task->total || !task->done || task->done >= task->total) {
+    task->eta = 0;
+    return;
+  }
+
+  sample = &task->eta_samples[task->eta_sample_next];
+  sample->done = task->done;
+  sample->time = *now_mono;
+  task->eta_sample_next = (task->eta_sample_next + 1) % ETA_SAMPLE_SLOTS;
+  if(task->eta_sample_count < ETA_SAMPLE_SLOTS) {
+    task->eta_sample_count++;
+  }
+
+  for(i = 0; i < task->eta_sample_count; i++) {
+    task_eta_sample_t *candidate = &task->eta_samples[i];
+    long long age_ns;
+
+    if(!candidate->time.tv_sec || candidate->done >= task->done) {
+      continue;
+    }
+    age_ns = timespec_delta_ns(now_mono, &candidate->time);
+    if(age_ns <= 0 || age_ns > (long long)ETA_AVERAGE_WINDOW_SECONDS * 1000000000LL) {
+      continue;
+    }
+    if(!base || age_ns > timespec_delta_ns(now_mono, &base->time)) {
+      base = candidate;
+    }
+  }
+
+  if(base) {
+    long long elapsed_ns = timespec_delta_ns(now_mono, &base->time);
+    unsigned long long delta = task->done - base->done;
+    unsigned long long remaining = task->total - task->done;
+    if(delta && elapsed_ns > 0) {
+      long double seconds = (long double)elapsed_ns / 1000000000.0L;
+      long double eta = ((long double)remaining / (long double)delta) * seconds;
+      task->eta = eta > 0 ? (unsigned long long)(eta + 0.999999L) : 0;
+      return;
+    }
+  }
+
+  task->eta = task->speed ? (task->total - task->done + task->speed - 1) / task->speed : 0;
+}
+
 static void
 task_update(file_task_t *task, task_state_t state, const char *current,
             unsigned long long add_done, const char *error) {
@@ -445,9 +520,7 @@ task_update(file_task_t *task, task_state_t state, const char *current,
       task->done = task->total;
     }
     if(task->speed_sample_time.tv_sec) {
-      long long elapsed_ns =
-        (long long)(now_mono.tv_sec - task->speed_sample_time.tv_sec) * 1000000000LL +
-        (long long)(now_mono.tv_nsec - task->speed_sample_time.tv_nsec);
+      long long elapsed_ns = timespec_delta_ns(&now_mono, &task->speed_sample_time);
       if(elapsed_ns >= 250000000LL) {
         unsigned long long delta = task->done - task->speed_sample_done;
         task->speed = (unsigned long long)((delta * 1000000000ULL) /
@@ -459,6 +532,7 @@ task_update(file_task_t *task, task_state_t state, const char *current,
       task->speed_sample_done = task->done;
       task->speed_sample_time = now_mono;
     }
+    task_update_eta_locked(task, &now_mono);
   }
   if(error) {
     snprintf(task->error, sizeof(task->error), "%s", error);
@@ -824,19 +898,20 @@ send_text_file(struct MHD_Connection *conn, char *data, size_t size,
   return ret;
 }
 
-static int count_path_bytes(file_task_t *task, const char *path,
-                            const char *display, const char *target,
-                            unsigned long long *total,
-                            unsigned long long *reclaimable,
-                            size_t *file_count, size_t *dir_count);
 static int task_target_path(file_task_t *task, const char *src,
                             char *out, size_t size);
 
+static int count_path_bytes_sync(file_task_t *task, const char *path,
+                                 const char *display, const char *target,
+                                 unsigned long long *total,
+                                 unsigned long long *reclaimable,
+                                 size_t *file_count, size_t *dir_count);
+
 static int
-count_dir_bytes(file_task_t *task, const char *path, const char *display,
-                const char *target, unsigned long long *total,
-                unsigned long long *reclaimable, size_t *file_count,
-                size_t *dir_count) {
+count_dir_bytes_sync(file_task_t *task, const char *path, const char *display,
+                     const char *target, unsigned long long *total,
+                     unsigned long long *reclaimable, size_t *file_count,
+                     size_t *dir_count) {
   DIR *dir = opendir(path);
   struct dirent *entry;
   int ret = -1;
@@ -859,9 +934,9 @@ count_dir_bytes(file_task_t *task, const char *path, const char *display,
                              entry->d_name)) ||
        (target && path_join(target_child, sizeof(target_child), target,
                             entry->d_name)) ||
-       count_path_bytes(task, child, display ? display_child : NULL,
-                        target ? target_child : NULL, total, reclaimable,
-                        file_count, dir_count)) {
+       count_path_bytes_sync(task, child, display ? display_child : NULL,
+                             target ? target_child : NULL, total, reclaimable,
+                             file_count, dir_count)) {
       goto done;
     }
   }
@@ -872,10 +947,10 @@ done:
 }
 
 static int
-count_path_bytes(file_task_t *task, const char *path, const char *display,
-                 const char *target, unsigned long long *total,
-                 unsigned long long *reclaimable, size_t *file_count,
-                 size_t *dir_count) {
+count_path_bytes_sync(file_task_t *task, const char *path, const char *display,
+                      const char *target, unsigned long long *total,
+                      unsigned long long *reclaimable, size_t *file_count,
+                      size_t *dir_count) {
   struct stat st;
   struct stat target_st;
   int target_exists = 0;
@@ -886,7 +961,6 @@ count_path_bytes(file_task_t *task, const char *path, const char *display,
   if(task) {
     task_update(task, TASK_RUNNING, display ? display : path, 0, NULL);
   }
-
   if(lstat(path, &st)) {
     return -1;
   }
@@ -899,9 +973,10 @@ count_path_bytes(file_task_t *task, const char *path, const char *display,
   }
   if(S_ISDIR(st.st_mode)) {
     if(dir_count) (*dir_count)++;
-    return count_dir_bytes(task, path, display,
-                           target_exists && S_ISDIR(target_st.st_mode) ? target : NULL,
-                           total, reclaimable, file_count, dir_count);
+    return count_dir_bytes_sync(task, path, display,
+                                target_exists && S_ISDIR(target_st.st_mode) ?
+                                target : NULL,
+                                total, reclaimable, file_count, dir_count);
   }
   if(S_ISREG(st.st_mode)) {
     *total += (unsigned long long)st.st_size;
@@ -912,6 +987,319 @@ count_path_bytes(file_task_t *task, const char *path, const char *display,
   }
   return 0;
 }
+
+#if FILEMGR_AGGRESSIVE_COPY
+typedef struct count_job {
+  char path[PATH_MAX];
+  char display[PATH_MAX];
+  char target[PATH_MAX];
+  int has_display;
+  int has_target;
+  struct count_job *next;
+} count_job_t;
+
+typedef struct count_queue {
+  file_task_t *task;
+  pthread_mutex_t lock;
+  pthread_cond_t has_work;
+  pthread_cond_t has_space;
+  pthread_cond_t idle;
+  pthread_t workers[SMALL_COPY_WORKERS];
+  count_job_t *head;
+  count_job_t *tail;
+  int queued;
+  int active;
+  int stopping;
+  int error;
+  int error_number;
+  int worker_count;
+  unsigned long long total;
+  unsigned long long reclaimable;
+  size_t file_count;
+  size_t dir_count;
+} count_queue_t;
+
+static void
+count_queue_add(count_queue_t *queue, unsigned long long total,
+                unsigned long long reclaimable, size_t file_count,
+                size_t dir_count) {
+  pthread_mutex_lock(&queue->lock);
+  queue->total += total;
+  queue->reclaimable += reclaimable;
+  queue->file_count += file_count;
+  queue->dir_count += dir_count;
+  pthread_mutex_unlock(&queue->lock);
+}
+
+static void *
+count_queue_worker(void *arg) {
+  count_queue_t *queue = arg;
+
+  for(;;) {
+    count_job_t *job;
+    unsigned long long total = 0;
+    unsigned long long reclaimable = 0;
+    size_t file_count = 0;
+    size_t dir_count = 0;
+    int ret;
+
+    pthread_mutex_lock(&queue->lock);
+    while(!queue->stopping && !queue->head) {
+      pthread_cond_wait(&queue->has_work, &queue->lock);
+    }
+    if(queue->stopping && !queue->head) {
+      pthread_mutex_unlock(&queue->lock);
+      return NULL;
+    }
+    job = queue->head;
+    queue->head = job->next;
+    if(!queue->head) {
+      queue->tail = NULL;
+    }
+    queue->queued--;
+    queue->active++;
+    pthread_cond_signal(&queue->has_space);
+    pthread_mutex_unlock(&queue->lock);
+
+    ret = count_path_bytes_sync(queue->task, job->path,
+                                job->has_display ? job->display : NULL,
+                                job->has_target ? job->target : NULL,
+                                &total, &reclaimable, &file_count, &dir_count);
+    if(!ret) {
+      count_queue_add(queue, total, reclaimable, file_count, dir_count);
+    }
+
+    pthread_mutex_lock(&queue->lock);
+    if(ret) {
+      queue->error = 1;
+      queue->error_number = errno ? errno : EIO;
+      queue->stopping = 1;
+      pthread_cond_broadcast(&queue->has_work);
+    }
+    queue->active--;
+    if(!queue->head && !queue->active) {
+      pthread_cond_broadcast(&queue->idle);
+    }
+    pthread_mutex_unlock(&queue->lock);
+    free(job);
+  }
+}
+
+static int
+count_queue_init(count_queue_t *queue, file_task_t *task) {
+  int i;
+
+  memset(queue, 0, sizeof(*queue));
+  queue->task = task;
+  if(pthread_mutex_init(&queue->lock, NULL)) {
+    return -1;
+  }
+  if(pthread_cond_init(&queue->has_work, NULL)) {
+    pthread_mutex_destroy(&queue->lock);
+    return -1;
+  }
+  if(pthread_cond_init(&queue->has_space, NULL)) {
+    pthread_cond_destroy(&queue->has_work);
+    pthread_mutex_destroy(&queue->lock);
+    return -1;
+  }
+  if(pthread_cond_init(&queue->idle, NULL)) {
+    pthread_cond_destroy(&queue->has_space);
+    pthread_cond_destroy(&queue->has_work);
+    pthread_mutex_destroy(&queue->lock);
+    return -1;
+  }
+  for(i = 0; i < SMALL_COPY_WORKERS; i++) {
+    if(pthread_create(&queue->workers[i], NULL, count_queue_worker, queue)) {
+      queue->stopping = 1;
+      pthread_cond_broadcast(&queue->has_work);
+      while(queue->worker_count > 0) {
+        pthread_join(queue->workers[--queue->worker_count], NULL);
+      }
+      pthread_cond_destroy(&queue->idle);
+      pthread_cond_destroy(&queue->has_space);
+      pthread_cond_destroy(&queue->has_work);
+      pthread_mutex_destroy(&queue->lock);
+      return -1;
+    }
+    queue->worker_count++;
+  }
+  return 0;
+}
+
+static int
+count_queue_enqueue(count_queue_t *queue, const char *path, const char *display,
+                    const char *target) {
+  count_job_t *job;
+
+  if(!(job = calloc(1, sizeof(*job)))) {
+    return -1;
+  }
+  snprintf(job->path, sizeof(job->path), "%s", path);
+  if(display) {
+    snprintf(job->display, sizeof(job->display), "%s", display);
+    job->has_display = 1;
+  }
+  if(target) {
+    snprintf(job->target, sizeof(job->target), "%s", target);
+    job->has_target = 1;
+  }
+
+  pthread_mutex_lock(&queue->lock);
+  while(!queue->stopping && queue->queued >= FILE_TASK_QUEUE_LIMIT) {
+    pthread_cond_wait(&queue->has_space, &queue->lock);
+  }
+  if(queue->stopping || queue->error || task_cancel_requested(queue->task)) {
+    pthread_mutex_unlock(&queue->lock);
+    free(job);
+    errno = queue->error_number ? queue->error_number : ECANCELED;
+    return -1;
+  }
+  if(queue->tail) {
+    queue->tail->next = job;
+  } else {
+    queue->head = job;
+  }
+  queue->tail = job;
+  queue->queued++;
+  pthread_cond_signal(&queue->has_work);
+  pthread_mutex_unlock(&queue->lock);
+  return 0;
+}
+
+static int
+count_queue_finish(count_queue_t *queue, int abort_pending) {
+  count_job_t *job;
+  int ret = abort_pending ? -1 : 0;
+  int i;
+
+  pthread_mutex_lock(&queue->lock);
+  while(!abort_pending && !queue->error && (queue->head || queue->active)) {
+    pthread_cond_wait(&queue->idle, &queue->lock);
+  }
+  if(queue->error) {
+    errno = queue->error_number ? queue->error_number : EIO;
+    ret = -1;
+  }
+  queue->stopping = 1;
+  if(abort_pending || ret) {
+    while(queue->head) {
+      job = queue->head;
+      queue->head = job->next;
+      free(job);
+    }
+    queue->tail = NULL;
+    queue->queued = 0;
+  }
+  pthread_cond_broadcast(&queue->has_work);
+  pthread_cond_broadcast(&queue->has_space);
+  pthread_mutex_unlock(&queue->lock);
+
+  for(i = 0; i < queue->worker_count; i++) {
+    pthread_join(queue->workers[i], NULL);
+  }
+  while(queue->head) {
+    job = queue->head;
+    queue->head = job->next;
+    free(job);
+  }
+  pthread_cond_destroy(&queue->idle);
+  pthread_cond_destroy(&queue->has_space);
+  pthread_cond_destroy(&queue->has_work);
+  pthread_mutex_destroy(&queue->lock);
+  return ret;
+}
+
+static int
+count_path_bytes(file_task_t *task, const char *path, const char *display,
+                 const char *target, unsigned long long *total,
+                 unsigned long long *reclaimable, size_t *file_count,
+                 size_t *dir_count) {
+  DIR *dir;
+  struct dirent *entry;
+  struct stat st;
+  struct stat target_st;
+  int target_exists = 0;
+  int ret = -1;
+  int queue_finished = 0;
+  count_queue_t queue;
+
+  if(task && task_cancel_requested(task)) {
+    return -1;
+  }
+  if(lstat(path, &st)) {
+    return -1;
+  }
+  if(!S_ISDIR(st.st_mode)) {
+    return count_path_bytes_sync(task, path, display, target, total,
+                                 reclaimable, file_count, dir_count);
+  }
+  if(task) {
+    task_update(task, TASK_RUNNING, display ? display : path, 0, NULL);
+  }
+  if(target) {
+    if(!lstat(target, &target_st)) {
+      target_exists = S_ISDIR(target_st.st_mode);
+    } else if(errno != ENOENT) {
+      return -1;
+    }
+  }
+  if(dir_count) (*dir_count)++;
+  if(count_queue_init(&queue, task)) {
+    return -1;
+  }
+  if(!(dir = opendir(path))) {
+    count_queue_finish(&queue, 1);
+    return -1;
+  }
+
+  while((entry = readdir(dir))) {
+    char child[PATH_MAX];
+    char display_child[PATH_MAX];
+    char target_child[PATH_MAX];
+
+    if(!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) {
+      continue;
+    }
+    if(task && task_cancel_requested(task)) {
+      errno = ECANCELED;
+      goto done;
+    }
+    if(path_join(child, sizeof(child), path, entry->d_name) ||
+       (display && path_join(display_child, sizeof(display_child), display,
+                             entry->d_name)) ||
+       (target_exists && path_join(target_child, sizeof(target_child), target,
+                                   entry->d_name)) ||
+       count_queue_enqueue(&queue, child, display ? display_child : NULL,
+                           target_exists ? target_child : NULL)) {
+      goto done;
+    }
+  }
+
+  ret = count_queue_finish(&queue, 0);
+  queue_finished = 1;
+  if(!ret) {
+    *total += queue.total;
+    if(reclaimable) {
+      *reclaimable += queue.reclaimable;
+    }
+    if(file_count) {
+      *file_count += queue.file_count;
+    }
+    if(dir_count) {
+      *dir_count += queue.dir_count;
+    }
+  }
+done:
+  closedir(dir);
+  if(ret && !queue_finished) {
+    count_queue_finish(&queue, 1);
+  }
+  return ret;
+}
+#else
+#define count_path_bytes count_path_bytes_sync
+#endif
 
 static int
 ignore_chmod_error(int err) {
@@ -1039,6 +1427,7 @@ done:
   return ret;
 }
 
+#if FILEMGR_PIPELINE_COPY
 static void
 pipeline_fail_locked(copy_pipeline_t *p, int error) {
   p->error = 1;
@@ -1215,9 +1604,11 @@ done:
   if(ret) unlink(dst);
   return ret;
 }
+#endif
 
 static int
 copy_file(file_task_t *task, const char *src, const char *dst) {
+#if FILEMGR_PIPELINE_COPY
   struct stat st;
 
   if(lstat(src, &st)) {
@@ -1226,6 +1617,7 @@ copy_file(file_task_t *task, const char *src, const char *dst) {
   if(st.st_size >= LARGE_FILE_THRESHOLD) {
     return copy_file_pipeline(task, src, dst);
   }
+#endif
   return copy_file_buffered(task, src, dst);
 }
 
@@ -1233,6 +1625,25 @@ static int copy_path(file_task_t *task, const char *src, const char *dst);
 static int remove_path(file_task_t *task, const char *path);
 static int check_remove_path_writable(file_task_t *task, const char *path);
 static int mode_access(const char *path, int mode);
+
+static int
+ensure_copy_dir(const char *path) {
+  struct stat st;
+
+  if(mkdir(path, 0777)) {
+    if(errno != EEXIST) {
+      return -1;
+    }
+    if(lstat(path, &st)) {
+      return -1;
+    }
+    if(!S_ISDIR(st.st_mode)) {
+      errno = ENOTDIR;
+      return -1;
+    }
+  }
+  return chmod_path_0777(path);
+}
 
 static int
 check_remove_entry_writable(const char *path) {
@@ -1312,6 +1723,7 @@ finish_copied_move(file_task_t *task, const char *src) {
   return ret;
 }
 
+#if FILEMGR_AGGRESSIVE_COPY
 static int copy_dir_queued(file_task_t *task, const char *src, const char *dst,
                            copy_queue_t *queue);
 
@@ -1417,7 +1829,7 @@ copy_queue_enqueue(copy_queue_t *queue, const char *src, const char *dst) {
   snprintf(job->dst, sizeof(job->dst), "%s", dst);
 
   pthread_mutex_lock(&queue->lock);
-  while(!queue->stopping && queue->queued >= SMALL_COPY_QUEUE_LIMIT) {
+  while(!queue->stopping && queue->queued >= FILE_TASK_QUEUE_LIMIT) {
     pthread_cond_wait(&queue->has_space, &queue->lock);
   }
   if(queue->stopping || queue->error || task_cancel_requested(queue->task)) {
@@ -1509,7 +1921,7 @@ copy_dir_queued(file_task_t *task, const char *src, const char *dst,
                 copy_queue_t *queue) {
   DIR *dir;
   struct dirent *entry;
-  struct stat dst_st;
+  struct stat st;
   int ret = -1;
 
   task_update(task, TASK_RUNNING, dst, 0, NULL);
@@ -1517,19 +1929,7 @@ copy_dir_queued(file_task_t *task, const char *src, const char *dst,
   if(task_cancel_requested(task)) {
     return -1;
   }
-  if(mkdir(dst, 0777)) {
-    if(errno != EEXIST) {
-      return -1;
-    }
-    if(lstat(dst, &dst_st)) {
-      return -1;
-    }
-    if(!S_ISDIR(dst_st.st_mode)) {
-      errno = ENOTDIR;
-      return -1;
-    }
-  }
-  if(chmod_path_0777(dst)) {
+  if(ensure_copy_dir(dst)) {
     return -1;
   }
   if(!(dir = opendir(src))) {
@@ -1550,19 +1950,22 @@ copy_dir_queued(file_task_t *task, const char *src, const char *dst,
        path_join(to, sizeof(to), dst, entry->d_name)) {
       goto done;
     }
-    if(lstat(from, &dst_st)) {
+    if(lstat(from, &st)) {
       goto done;
     }
-    if(S_ISDIR(dst_st.st_mode)) {
+    if(S_ISDIR(st.st_mode)) {
       if(copy_dir_queued(task, from, to, queue)) {
         goto done;
       }
-    } else if(S_ISREG(dst_st.st_mode)) {
-      if(dst_st.st_size >= LARGE_FILE_THRESHOLD) {
+    } else if(S_ISREG(st.st_mode)) {
+#if FILEMGR_PIPELINE_COPY
+      if(st.st_size >= LARGE_FILE_THRESHOLD) {
         if(copy_queue_wait(queue) || copy_file_pipeline(task, from, to)) {
           goto done;
         }
-      } else if(copy_queue_enqueue(queue, from, to)) {
+      } else
+#endif
+      if(copy_queue_enqueue(queue, from, to)) {
         goto done;
       }
     } else {
@@ -1576,6 +1979,48 @@ done:
   closedir(dir);
   return ret;
 }
+#else
+static int
+copy_dir(file_task_t *task, const char *src, const char *dst) {
+  DIR *dir;
+  struct dirent *entry;
+  int ret = -1;
+
+  task_update(task, TASK_RUNNING, dst, 0, NULL);
+
+  if(task_cancel_requested(task)) {
+    return -1;
+  }
+  if(ensure_copy_dir(dst)) {
+    return -1;
+  }
+  if(!(dir = opendir(src))) {
+    return -1;
+  }
+
+  while((entry = readdir(dir))) {
+    char from[PATH_MAX];
+    char to[PATH_MAX];
+
+    if(!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) {
+      continue;
+    }
+    if(task_cancel_requested(task)) {
+      goto done;
+    }
+    if(path_join(from, sizeof(from), src, entry->d_name) ||
+       path_join(to, sizeof(to), dst, entry->d_name) ||
+       copy_path(task, from, to)) {
+      goto done;
+    }
+  }
+
+  ret = 0;
+done:
+  closedir(dir);
+  return ret;
+}
+#endif
 
 static int
 copy_path(file_task_t *task, const char *src, const char *dst) {
@@ -2101,7 +2546,13 @@ task_worker(void *arg) {
         }
       }
       if(needs_space) {
-        compare_target = target;
+        struct stat target_st;
+        if(!lstat(target, &target_st)) {
+          compare_target = target;
+        } else if(errno != ENOENT) {
+          task_update(task, TASK_FAILED, target, 0, strerror(errno));
+          return NULL;
+        }
       }
       if(count_path_bytes(task, task->srcs[i], task->srcs[i], compare_target,
                           &total, &reclaimable,
@@ -2190,6 +2641,8 @@ task_worker(void *arg) {
        completed_at - task->created_at >= TRANSFER_ALERT_THRESHOLD) {
       g_last_completion.id = task->id;
       g_last_completion.op = task->op;
+      snprintf(g_last_completion.src, sizeof(g_last_completion.src), "%s", task->src);
+      g_last_completion.src_count = task->src_count;
       g_last_completion.total = task->total;
       g_last_completion.file_count = task->dir_count ? task->file_count : 0;
       g_last_completion.elapsed = completed_at - task->created_at;
@@ -2347,6 +2800,7 @@ static enum MHD_Result
 api_tasks(struct MHD_Connection *conn) {
   strbuf_t b = {0};
   file_task_t *task;
+  time_t now = time(NULL);
   int first = 1;
 
   strbuf_append(&b, "{\"ok\":true,\"tasks\":[");
@@ -2370,18 +2824,21 @@ api_tasks(struct MHD_Connection *conn) {
     json_escape(&b, task->error_code);
     strbuf_append(&b, ",\"error_arg\":");
     json_escape(&b, task->error_arg);
-    strbuf_printf(&b, ",\"src_count\":%zu,\"total\":%llu,\"done\":%llu,\"speed\":%llu,\"cancel_requested\":%s,\"created_at\":%lld,\"elapsed\":%lld,\"updated_at\":%lld}",
-                  task->src_count, task->total, task->done, task->speed,
+    strbuf_printf(&b, ",\"src_count\":%zu,\"total\":%llu,\"done\":%llu,\"speed\":%llu,\"eta\":%llu,\"cancel_requested\":%s,\"created_at\":%lld,\"elapsed\":%lld,\"total_elapsed\":%lld,\"updated_at\":%lld}",
+                  task->src_count, task->total, task->done, task->speed, task->eta,
                   task->cancel_requested ? "true" : "false",
                   (long long)task->created_at,
-                  task->transfer_started_at ? (long long)(time(NULL) - task->transfer_started_at) : 0LL,
+                  task->transfer_started_at ? (long long)(now - task->transfer_started_at) : 0LL,
+                  task->created_at ? (long long)(now - task->created_at) : 0LL,
                   (long long)task->updated_at);
   }
-  strbuf_append(&b, "],\"completion\":");
+  strbuf_printf(&b, "],\"now\":%lld,\"completion\":", (long long)now);
   if(g_last_completion.id) {
-    strbuf_printf(&b, "{\"id\":%lu,\"op\":\"%s\",\"elapsed\":%lld,"
-                  "\"total\":%llu,\"file_count\":%zu}",
-                  g_last_completion.id, task_op_name(g_last_completion.op),
+    strbuf_printf(&b, "{\"id\":%lu,\"op\":\"%s\",\"src\":",
+                  g_last_completion.id, task_op_name(g_last_completion.op));
+    json_escape(&b, g_last_completion.src);
+    strbuf_printf(&b, ",\"src_count\":%zu,\"elapsed\":%lld,\"total\":%llu,\"file_count\":%zu}",
+                  g_last_completion.src_count,
                   (long long)g_last_completion.elapsed,
                   g_last_completion.total, g_last_completion.file_count);
   } else {

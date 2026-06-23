@@ -13,16 +13,18 @@ let hoverResumeTimer = 0;
 let hoveredRow = null;
 let loadingPath = null;
 let directoryLoadingTimer = 0;
+let taskOverlayTimer = 0;
 let lastCompletionId = null;
+let taskPollFailedAlertShown = false;
 let textEditorPath = null;
 let textEditorVersion = null;
 let textEditorOriginal = "";
 let textEditorBusy = false;
 let L = {};
 
-const APP_VERSION = "v0.5";
+const APP_VERSION = "v0.6";
 const LAST_PATH_KEY = "ps5-web-file-mgr:last-path";
-const DIRECTORY_LOADING_DELAY = 250;
+const LOADING_DISPLAY_DELAY = 250;
 
 const filesEl = document.getElementById("files");
 const contentEl = document.getElementById("content");
@@ -182,18 +184,21 @@ function formatDuration(seconds) {
 
 function averageEta(task, done, total) {
   if (!total || !done || done >= total) return "--";
-  const elapsed = Math.max(1, Number(task.elapsed || 0));
-  const averageSpeed = done / elapsed;
-  return averageSpeed > 0 ? formatDuration((total - done) / averageSpeed) : "--";
+  const eta = Number(task.eta || 0);
+  return eta > 0 ? formatDuration(eta) : "--";
 }
 
 function taskElapsed(task) {
-  const created = Number(task.created_at || 0);
-  return created ? formatDuration(Date.now() / 1000 - created) : "--";
+  if (!task || !Object.prototype.hasOwnProperty.call(task, "total_elapsed")) return "--";
+  return formatDuration(Number(task.total_elapsed || 0));
 }
 
 function opLabel(op) {
   return { copy: t("copy"), move: t("move"), delete: t("delete") }[op] || op;
+}
+
+function taskOpLabel(op) {
+  return { copy: t("copying"), move: t("moving"), delete: t("deleting") }[op] || op;
 }
 
 function stateLabel(state) {
@@ -260,6 +265,21 @@ function setStatus(text) {
 function setBusy(value) {
   busy = value;
   updateButtons();
+}
+
+function showTaskOverlay() {
+  setBusy(true);
+  if (!overlayEl.hidden || taskOverlayTimer) return;
+  taskOverlayTimer = setTimeout(() => {
+    taskOverlayTimer = 0;
+    overlayEl.hidden = false;
+  }, LOADING_DISPLAY_DELAY);
+}
+
+function hideTaskOverlay() {
+  clearTimeout(taskOverlayTimer);
+  taskOverlayTimer = 0;
+  overlayEl.hidden = true;
 }
 
 function showActionFailed(label, error) {
@@ -487,12 +507,16 @@ function pathName(path) {
   return pos >= 0 ? clean.slice(pos + 1) || "/" : clean;
 }
 
-function renderTaskName(el, task) {
+function taskSubject(task) {
   const count = Number(task.src_count || 0);
-  const target = count > 1 ? t("countItems", { count }) : pathName(task.src);
+  return count > 1 ? t("countItems", { count }) : pathName(task.src);
+}
+
+function renderTaskName(el, task) {
+  const target = taskSubject(task);
   const op = document.createElement("span");
   op.className = "task-name-op";
-  op.textContent = opLabel(task.op);
+  op.textContent = taskOpLabel(task.op);
   const subject = document.createElement("span");
   subject.className = "task-name-subject";
   subject.textContent = target;
@@ -707,7 +731,7 @@ async function load(path, scrollTop, force) {
     contentLoadingEl.hidden = false;
     contentEl.classList.add("loading");
     updateButtons();
-  }, DIRECTORY_LOADING_DELAY);
+  }, LOADING_DISPLAY_DELAY);
   try {
     setStatus(t("readDir"));
     const data = await api("/api/list", { path });
@@ -866,7 +890,7 @@ function renderPendingOverlay(text) {
     if (pendingAbortController) pendingAbortController.abort();
     pendingAbortController = null;
     pendingOverlayText = "";
-    overlayEl.hidden = true;
+    hideTaskOverlay();
     setStatus(t("cancelPrepare"));
     setBusy(false);
   });
@@ -877,9 +901,8 @@ function renderPendingOverlay(text) {
 
 function showPendingOverlay(text) {
   pendingOverlayText = text;
-  overlayEl.hidden = false;
   renderPendingOverlay(text);
-  setBusy(true);
+  showTaskOverlay();
 }
 
 function renderTaskPath(element, path) {
@@ -947,7 +970,7 @@ async function actionPaste() {
     const aborted = err && err.name === "AbortError";
     pendingAbortController = null;
     pendingOverlayText = "";
-    overlayEl.hidden = true;
+    hideTaskOverlay();
     if (aborted) setStatus(t("cancelPrepare"));
     else showActionFailed(label, err.message);
     renderClipboard();
@@ -958,16 +981,18 @@ async function actionPaste() {
 function renderTasks(tasks) {
   const active = tasks.find(task => task.state === "queued" || task.state === "running");
   if (!active && pendingOverlayText) {
-    overlayEl.hidden = false;
     renderPendingOverlay(pendingOverlayText);
-    setBusy(true);
+    showTaskOverlay();
     return;
   }
 
   tasksEl.innerHTML = "";
   const hasActive = Boolean(active);
-  overlayEl.hidden = !hasActive;
-  setBusy(hasActive);
+  if (hasActive) showTaskOverlay();
+  else {
+    hideTaskOverlay();
+    setBusy(false);
+  }
 
   if (!hasActive) return;
 
@@ -979,7 +1004,7 @@ function renderTasks(tasks) {
   const isPreparing = (task.op === "copy" || task.op === "move") &&
     task.state === "running" && done === 0;
   const isFinishing = !isDelete && task.state === "running" && total > 0 && done >= total;
-  const pct = total > 0 ? Math.min(100, Math.round(done * 100 / total)) : 0;
+  const pct = total > 0 ? Math.min(100, Math.floor(done * 100 / total)) : 0;
   const div = document.createElement("div");
   div.className = "task " + task.state;
 
@@ -1046,6 +1071,7 @@ function renderTasks(tasks) {
 async function pollTasks() {
   try {
     const data = await api("/api/tasks");
+    taskPollFailedAlertShown = false;
     const tasks = data.tasks || [];
     const completion = data.completion;
     if (lastCompletionId === null) {
@@ -1054,6 +1080,7 @@ async function pollTasks() {
       lastCompletionId = completion.id;
       alert(t(completion.file_count ? "transferCompleteFiles" : "transferComplete", {
         label: opLabel(completion.op),
+        name: taskSubject(completion),
         duration: formatDuration(Number(completion.elapsed || 0)),
         size: formatBytes(completion.total, true),
         count: completion.file_count
@@ -1085,7 +1112,8 @@ async function pollTasks() {
       await refreshSpaces();
     }
   } catch (err) {
-    setStatus(t("tasksPollFailed", { error: err.message }));
+    const message = t("tasksPollFailed", { error: err.message });
+    setStatus(message);
   }
 }
 

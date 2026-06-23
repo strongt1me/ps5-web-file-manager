@@ -3,3 +3,4 @@ gen/
 web-file-mgr-linux
 *.o
 *.d
+tools/

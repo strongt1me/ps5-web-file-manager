@@ -93,6 +93,11 @@ On first startup the payload installs a `PS5 Web File Manager` web shortcut in t
 - The UI can recover the active task display if the browser is closed and reopened while the payload process is still running.
 - Text editing is limited to common text-file extensions. Non-UTF-8 and oversized files are rejected.
 
+## FAQ
+- This is a homebrew app which does not affect system process or memory. It should crash itself instead of kernel panic theoretically. If kernel panic happens, make sure you'r using the latest jailbreak methods which includes latest elfldr. Or switch back to the stable method you have been using.
+- If you're using P2JB, I suggest not to use this if kernel panic happened. It is suffering to wait another 50 min because of kernel panic. Stability first for P2JB.
+- The preparing stage is calculating the folder size. It would be pretty slow if there are too many files in this folder. It make sure if there is enough available space for this folder you were trying to copy/move.
+
 ## Credits
 
 This project was built with reference to these projects:
